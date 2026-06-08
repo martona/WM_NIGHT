@@ -1,0 +1,12 @@
+# Build output (OutDir = build\<Config>\<Platform>\, incl. unstick .dll.NNNNNN asides)
+/build/
+
+# vcpkg manifest-mode install tree (Detours)
+/vcpkg_installed/
+
+# Diagnostic logs (UMBRA_DIAG) + dbghelp symbol cache
+/logs/
+
+# Visual Studio / user-specific
+/.vs/
+*.user

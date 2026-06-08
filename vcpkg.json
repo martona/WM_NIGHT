@@ -1,0 +1,10 @@
+{
+  "name": "wm-night",
+  "version-string": "1.0.0",
+  "description": "WM_NIGHT - injection harness for the umbra dark-mode library: host umbra-inject.exe + injected umbra-payload.dll. Pulls Microsoft Detours for the payload's inline GetSysColor / uxtheme / dui70 hooks. The umbra library itself is consumed from ../WM_UMBRA by project reference, not vcpkg.",
+  "homepage": "https://github.com/martona/WM_NIGHT",
+  "dependencies": [
+    "detours"
+  ],
+  "builtin-baseline": "10ceb139a610ebf3c6aa49cdc4a4b7f3db5d3f2b"
+}

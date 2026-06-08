@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{3A9C7E15-8B2D-4F6A-9C1E-2D4F60718293}</ProjectGuid>
+    <RootNamespace>umbrapayload</RootNamespace>
+    <ProjectName>umbra-payload</ProjectName>
+    <TargetName>umbra-payload</TargetName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <!-- One place that points at the umbra library working copy (../WM_UMBRA), consumed from
+       source via project reference rather than vcpkg during the transition. -->
+  <Import Project="WmUmbra.props" />
+
+  <!-- The hook layer (ProcessColorHook/ThemeColorHook) inline-hooks GetSysColor/uxtheme
+       via Detours; pull it in through vcpkg manifest mode (static triplet for /MT). -->
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnabled>true</VcpkgEnabled>
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgUseStatic Condition="'$(UmbraCRT)'!='DLL'">true</VcpkgUseStatic>
+    <VcpkgUseStatic Condition="'$(UmbraCRT)'=='DLL'">false</VcpkgUseStatic>
+  </PropertyGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
+            Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"
+            Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)build\$(Configuration)\$(Platform)\</OutDir>
+    <IntDir>$(OutDir)intermediate\umbra-payload\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <ConformanceMode>true</ConformanceMode>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(WmUmbraDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug' and '$(UmbraCRT)'=='DLL'">MultiThreadedDebugDLL</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug' and '$(UmbraCRT)'!='DLL'">MultiThreadedDebug</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release' and '$(UmbraCRT)'=='DLL'">MultiThreadedDLL</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release' and '$(UmbraCRT)'!='DLL'">MultiThreaded</RuntimeLibrary>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="umbra-payload.cpp" />
+    <!-- The proven hook layer (was sample-hook; folded into WM_NIGHT): GetSysColor + uxtheme
+         inline hooks, both compiled straight into the payload. -->
+    <ClCompile Include="ProcessColorHook.cpp" />
+    <ClCompile Include="ThemeColorHook.cpp" />
+    <!-- dui70 DirectUI::Element::PaintBackground hook (host resolves its RVA via symbols). -->
+    <ClCompile Include="DuiPaintHook.cpp" />
+  </ItemGroup>
+
+  <!-- Build + link the umbra static library from ../WM_UMBRA (source, not vcpkg). CRT model
+       matches via the static-CRT settings above. -->
+  <ItemGroup>
+    <ProjectReference Include="$(WmUmbraDir)\project\umbra.vcxproj">
+      <Project>{40E6196F-E54E-4BFF-8A94-449BB8E2E34F}</Project>
+    </ProjectReference>
+  </ItemGroup>
+
+  <!-- A global WH_CBT DLL lingers, still mapped, in target processes until they pump a
+       message after we unhook - which locks the file so the linker can't overwrite it
+       next build. Before compiling, rename a still-locked previous copy aside (a mapped
+       image can be renamed) so a fresh DLL links; sweep released asides. -->
+  <Target Name="UnstickPayloadDll" BeforeTargets="ClCompile">
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\unstick-payload.ps1&quot; -Dll &quot;$(OutDir)umbra-payload.dll&quot;"
+          ContinueOnError="true" />
+  </Target>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
