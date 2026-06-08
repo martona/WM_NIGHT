@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: MIT
 //
-// umbra-inject.exe — host / controller for the umbra dark-theming payload.
+// WM_NIGHT.exe — host / controller for the WM_NIGHThook dark-theming payload.
 //
-// Installs ONE global WH_CBT hook whose proc lives in umbra-payload.dll, then stays
+// Installs ONE global WH_CBT hook whose proc lives in WM_NIGHThook.dll, then stays
 // alive (pumping messages) so the hook stays live. WH_CBT maps the payload into each
 // target process as early as its first window; the payload whitelists regedit.exe and
-// themes from there. uiAccess (asInvoker + signed, see umbra-inject.vcxproj) lets this
+// themes from there. uiAccess (asInvoker + signed, see WM_NIGHT.vcxproj) lets this
 // medium-integrity host reach an elevated regedit without elevating itself — granted
 // only to a signed binary in a trusted path (we report whether we actually got it).
-//
-// Temporary in-tree sample; removed before this branch merges to umbra's main.
 
 #include <cstdio>
 #include <string>
@@ -252,11 +250,11 @@ int main()
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("umbra-inject - dark-theming host (stub: regedit title bar)\n");
+    std::printf("WM_NIGHT - dark-theming injection host\n");
     std::printf("uiAccess: %s\n\n",
                 HasUiAccess() ? "granted" : "NO (run signed from a trusted path, or elevate)");
 
-    const std::wstring dllPath = ModuleDir() + L"\\umbra-payload.dll";
+    const std::wstring dllPath = ModuleDir() + L"\\WM_NIGHThook.dll";
     HMODULE hookModule = ::LoadLibraryW(dllPath.c_str());
     if (hookModule == nullptr)
     {

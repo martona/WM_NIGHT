@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // DuiPaintHook.cpp — process-wide dui70 DirectUI::Element::PaintBackground hook.
-//   (umbra-inject payload — the DUI-element interception lever.)
+//   (WM_NIGHThook payload — the DUI-element interception lever.)
 //
 // The Control Panel header/sidebar (and other DirectUI element backgrounds) are filled inside
 // DirectUI::Element::PaintBackground, which runs BEFORE the offscreen memory-DC composite. Our
@@ -10,7 +10,7 @@
 // HWND to target — the theme-draw log tags these wnd=memDC). This hook sits one layer up: it
 // recolours the fill at its source, so the double-buffering is irrelevant.
 //
-// The member is non-exported, so the HOST (umbra-inject.exe) resolves its RVA via symbols and
+// The member is non-exported, so the HOST (WM_NIGHT.exe) resolves its RVA via symbols and
 // hands it to us through the exported UmbraSetDuiPaintBg() (see the shared-section note below).
 // We confirm the live dui70 matches (PE TimeDateStamp + SizeOfImage — a wrong RVA would crash
 // on attach), add the RVA to the loaded base, and Detour-attach. No-ops if the host gave us no

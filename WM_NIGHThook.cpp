@@ -1,21 +1,19 @@
 // SPDX-License-Identifier: MIT
 //
-// umbra-payload.dll — injected dark-theming payload (umbra-inject harness).
+// WM_NIGHThook.dll — injected dark-theming payload (WM_NIGHT harness).
 //
-// umbra-inject.exe installs ONE global WH_CBT hook whose proc lives here, so this DLL
+// WM_NIGHT.exe installs ONE global WH_CBT hook whose proc lives here, so this DLL
 // maps into target processes as early as their first window — before WM_NCCREATE.
 // On the allowlist (regedit) we, once per process, init umbra + install the process-wide
-// GetSysColor/uxtheme inline hooks (the proven ProcessColorHook/ThemeColorHook, shared
-// from sample-hook), and, once per thread, self-install WH_CALLWNDPROC[RET] on the
-// current thread so umbra themes every window at creation (prepDarkModeForNewWindow on
-// WM_NCCREATE, applyDarkToNewWindow on WM_CREATE).
+// GetSysColor/uxtheme inline hooks (the proven ProcessColorHook/ThemeColorHook), and,
+// once per thread, self-install WH_CALLWNDPROC[RET] on the current thread so umbra themes
+// every window at creation (prepDarkModeForNewWindow on WM_NCCREATE, applyDarkToNewWindow
+// on WM_CREATE).
 //
 // HCBT_CREATEWND fires before WM_NCCREATE, so the window that triggered our per-thread
 // install is itself caught — even regedit's frame themes through the normal path. And the
 // CBT hook's per-thread firing IS the thread coverage, so there is NO CreateThread detour
-// and NO child-walk: this is sample-hook's hook layer, productized for injection.
-//
-// Temporary in-tree sample; removed before this branch merges to umbra's main.
+// and NO child-walk.
 
 #include <windows.h>
 #include <commctrl.h>
@@ -41,7 +39,7 @@ namespace
     thread_local bool t_threadHooked = false;         // CALLWNDPROC[RET] installed on this thread?
     thread_local bool t_theming      = false;         // re-entrancy guard (theming sends messages)
 
-    // ---- TEMP DIAGNOSTIC: top-level theming trace -> <repo>\logs\umbra-inject.log ----
+    // ---- TEMP DIAGNOSTIC: top-level theming trace -> <repo>\logs\WM_NIGHThook.log ----
     HANDLE           g_dbg     = INVALID_HANDLE_VALUE;
     CRITICAL_SECTION g_dbgCs{};
     INIT_ONCE        g_dbgOnce = INIT_ONCE_STATIC_INIT;
@@ -56,7 +54,7 @@ namespace
         // hook's several processes — and a crash-and-restart — append rather than truncate each
         // other's capture; just delete the file for a clean run.
         wchar_t path[MAX_PATH];
-        umbraLogPath(L"umbra-inject.log", path, ARRAYSIZE(path));
+        umbraLogPath(L"WM_NIGHThook.log", path, ARRAYSIZE(path));
         g_dbg = ::CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 #endif

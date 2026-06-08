@@ -4,9 +4,9 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "umbra", "..\WM_UMBRA\project\umbra.vcxproj", "{40E6196F-E54E-4BFF-8A94-449BB8E2E34F}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "umbra-payload", "umbra-payload.vcxproj", "{3A9C7E15-8B2D-4F6A-9C1E-2D4F60718293}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WM_NIGHThook", "WM_NIGHThook.vcxproj", "{3A9C7E15-8B2D-4F6A-9C1E-2D4F60718293}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "umbra-inject", "umbra-inject.vcxproj", "{4B0D8F26-9C3E-4A7B-8D2F-3E5071829304}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WM_NIGHT", "WM_NIGHT.vcxproj", "{4B0D8F26-9C3E-4A7B-8D2F-3E5071829304}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
