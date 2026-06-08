@@ -10,3 +10,6 @@
 # Visual Studio / user-specific
 /.vs/
 *.user
+
+# claude
+.claude/
