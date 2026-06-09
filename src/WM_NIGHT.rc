@@ -1,0 +1,49 @@
+// SPDX-License-Identifier: MIT
+//
+// WM_NIGHT resources. Version fields are sourced from version.h so the product
+// version has exactly one control point.
+
+#include <windows.h>
+#include "resource.h"
+#include "version.h"
+
+/////////////////////////////////////////////////////////////////////////////
+// Icon. The first (lowest id) ICON becomes the application icon shown by the
+// shell; it is also the source for the notification-area (tray) icon.
+// Path is relative to this .rc file (src\ -> ..\resources).
+IDI_APPICON ICON "..\\resources\\WM_NIGHT.ico"
+
+/////////////////////////////////////////////////////////////////////////////
+// Version information (all values come from version.h).
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    WMN_VERSION_DIGITAL
+ PRODUCTVERSION WMN_VERSION_DIGITAL
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"          // U.S. English (0x0409), Unicode (1200 = 0x04B0)
+        BEGIN
+            VALUE "CompanyName",      WMN_COMPANY_NAME
+            VALUE "FileDescription",  WMN_FILE_DESCRIPTION
+            VALUE "FileVersion",      WMN_VERSION_STR
+            VALUE "InternalName",     WMN_INTERNAL_NAME
+            VALUE "LegalCopyright",   WMN_COPYRIGHT
+            VALUE "OriginalFilename", WMN_ORIGINAL_FILENAME
+            VALUE "ProductName",      WMN_PRODUCT_NAME
+            VALUE "ProductVersion",   WMN_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

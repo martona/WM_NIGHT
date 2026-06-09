@@ -1,30 +1,68 @@
 // SPDX-License-Identifier: MIT
 //
-// WM_NIGHT.exe — host / controller for the WM_NIGHThook dark-theming payload.
+// WM_NIGHT.exe — GUI (tray-resident) host / controller for the WM_NIGHThook payload.
 //
-// Installs ONE global WH_CBT hook whose proc lives in WM_NIGHThook.dll, then stays
-// alive (pumping messages) so the hook stays live. WH_CBT maps the payload into each
-// target process as early as its first window; the payload whitelists regedit.exe and
+// Installs ONE global WH_CBT hook whose proc lives in WM_NIGHThook.dll, then lives in the
+// notification area pumping messages so the hook stays live. WH_CBT maps the payload into
+// each target process as early as its first window; the payload whitelists its targets and
 // themes from there. uiAccess (asInvoker + signed, see WM_NIGHT.vcxproj) lets this
-// medium-integrity host reach an elevated regedit without elevating itself — granted
-// only to a signed binary in a trusted path (we report whether we actually got it).
+// medium-integrity host reach an elevated regedit without elevating itself.
 
-#include <cstdio>
+// Common-Controls v6: the dark-mode opt-in. With this dependency embedded in the manifest +
+// umbra::initDarkMode() at startup, the system draws our popup menu and message boxes dark
+// automatically — no owner-draw needed. (The linker merges this with the UAC trustInfo it
+// already generates, so there is still no separate .manifest file.)
+#pragma comment(linker,                                  \
+    "\"/manifestdependency:type='win32' "                \
+    "name='Microsoft.Windows.Common-Controls' "          \
+    "version='6.0.0.0' processorArchitecture='*' "       \
+    "publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+#include <cstdarg>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <windows.h>
+#include <shellapi.h>   // Shell_NotifyIcon / NOTIFYICONDATA (tray icon)
+#include <commctrl.h>   // LoadIconMetric, InitCommonControlsEx
+#include <shlobj.h>     // SHGetKnownFolderPath, SHCreateDirectoryExW
+#include <strsafe.h>    // StringCch* helpers
 #include <dbghelp.h>    // symbol resolution for dui70's non-exported Element::PaintBackground
 #include <tlhelp32.h>   // process snapshot, to bounce explorer.exe on shutdown
 
-#include "hook.h"   // kUmbraLogDir (symbol-cache dir under the repo)
+#include "umbra.h"      // dark-mode library (linked into the host for its own UI)
+#include "resource.h"
+#include "version.h"
 
 #pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 namespace
 {
-    HANDLE g_stop = nullptr;
+    constexpr UINT     kTrayCallback = WM_APP + 1;     // tray icon → WndProc notification
+    constexpr UINT     kTrayIconId   = 1;
+    constexpr wchar_t  kWndClassName[] = L"WM_NIGHT_Tray";
+
+    HINSTANCE g_hInst          = nullptr;
+    HWND      g_hWnd           = nullptr;   // hidden top-level owner of the tray icon
+    HMODULE   g_hookModule     = nullptr;
+    HHOOK     g_cbtHook        = nullptr;
+    HICON     g_trayIcon       = nullptr;
+    UINT      g_taskbarCreated = 0;         // RegisterWindowMessage("TaskbarCreated")
+
+    // Diagnostics now go to the debugger — a GUI-subsystem app has no console. All of this is
+    // best-effort: uiAccess is assumed to work, and the dui70 resolve below may fail silently.
+    void Dbg(const wchar_t* fmt, ...)
+    {
+        wchar_t buf[1024];
+        va_list ap;
+        va_start(ap, fmt);
+        ::wvsprintfW(buf, fmt, ap);
+        va_end(ap);
+        ::OutputDebugStringW(buf);
+    }
 
     std::wstring ModuleDir()
     {
@@ -33,21 +71,6 @@ namespace
         std::wstring p(path, (n != 0 && n < ARRAYSIZE(path)) ? n : 0);
         const size_t slash = p.find_last_of(L"\\/");
         return slash == std::wstring::npos ? L"." : p.substr(0, slash);
-    }
-
-    // Did we actually receive uiAccess? (Only granted to a signed binary in a trusted
-    // path; otherwise the manifest request is silently dropped and we run medium.)
-    bool HasUiAccess()
-    {
-        HANDLE token = nullptr;
-        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
-            return false;
-        DWORD uiAccess = 0;
-        DWORD returned = 0;
-        const bool ok =
-            ::GetTokenInformation(token, TokenUIAccess, &uiAccess, sizeof(uiAccess), &returned) != FALSE;
-        ::CloseHandle(token);
-        return ok && uiAccess != 0;
     }
 
     // --- dui70 Element::PaintBackground RVA resolution (host-side) -----------
@@ -103,6 +126,23 @@ namespace
         return TRUE;
     }
 
+    // The dui70 symbol cache lives under %LocalLow%: a shipping host in a trusted (read-only)
+    // install path can't cache the downloaded dui70.pdb next to itself, and LocalLow is the
+    // per-user, low-trust spot meant for exactly this kind of throwaway downloaded data.
+    std::wstring SymCacheDir()
+    {
+        // FOLDERID_LocalLow = {A520A1A4-1780-4FF6-BD18-167343C5AF16}, spelled out so we don't
+        // depend on the KnownFolders.h GUID export (absent in this SDK include config).
+        const GUID localLow =
+            { 0xA520A1A4, 0x1780, 0x4FF6, { 0xBD, 0x18, 0x16, 0x73, 0x43, 0xC5, 0xAF, 0x16 } };
+        PWSTR p = nullptr;
+        std::wstring dir;
+        if (SUCCEEDED(::SHGetKnownFolderPath(localLow, 0, nullptr, &p)) && p != nullptr)
+            dir.assign(p).append(L"\\WM_NIGHT\\symcache");
+        ::CoTaskMemFree(p);
+        return dir;
+    }
+
     bool ResolveDuiPaintBgRva(DWORD& outRva, DWORD& outStamp, DWORD& outSize)
     {
         wchar_t dui[MAX_PATH];
@@ -114,24 +154,29 @@ namespace
         DWORD diskStamp = 0, diskSize = 0;
         if (!ReadPeIdentityFromDisk(dui, diskStamp, diskSize))
         {
-            std::printf("[dui] cannot read %ls\n", dui);
+            Dbg(L"[dui] cannot read %ls\n", dui);
             return false;
         }
 
-        wchar_t cache[MAX_PATH];
-        ::StringCchPrintfW(cache, ARRAYSIZE(cache), L"%s\\symcache", kUmbraLogDir);
-        (void)::CreateDirectoryW(kUmbraLogDir, nullptr);
-        (void)::CreateDirectoryW(cache, nullptr);
+        const std::wstring cacheDir = SymCacheDir();
+        if (cacheDir.empty())
+        {
+            Dbg(L"[dui] no LocalLow path; skipping symbol resolution\n");
+            return false;
+        }
+        const int mk = ::SHCreateDirectoryExW(nullptr, cacheDir.c_str(), nullptr);
+        if (mk != ERROR_SUCCESS && mk != ERROR_ALREADY_EXISTS && mk != ERROR_FILE_EXISTS)
+            Dbg(L"[dui] could not create %ls (%d); symsrv may still proceed\n", cacheDir.c_str(), mk);
 
         wchar_t symPath[1024];
         ::StringCchPrintfW(symPath, ARRAYSIZE(symPath),
-            L"srv*%s*https://msdl.microsoft.com/download/symbols", cache);
+            L"srv*%s*https://msdl.microsoft.com/download/symbols", cacheDir.c_str());
 
         const HANDLE proc = ::GetCurrentProcess();
         ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
         if (!::SymInitializeW(proc, symPath, FALSE))
         {
-            std::printf("[dui] SymInitialize failed: %lu\n", ::GetLastError());
+            Dbg(L"[dui] SymInitialize failed: %lu\n", ::GetLastError());
             return false;
         }
 
@@ -139,7 +184,7 @@ namespace
         const DWORD64 base = ::SymLoadModuleExW(proc, nullptr, dui, nullptr, 0, 0, nullptr, 0);
         if (base == 0)
         {
-            std::printf("[dui] SymLoadModuleEx failed: %lu (symbols unreachable?)\n", ::GetLastError());
+            Dbg(L"[dui] SymLoadModuleEx failed: %lu (symbols unreachable?)\n", ::GetLastError());
         }
         else
         {
@@ -154,8 +199,8 @@ namespace
             DWORD64 chosen = 0;
             for (const SymHit& h : hits)
             {
-                std::printf("[dui]   candidate %-48s rva=0x%08lX\n",
-                            h.name.c_str(), static_cast<DWORD>(h.addr - base));
+                Dbg(L"[dui]   candidate %hs rva=0x%08lX\n",
+                    h.name.c_str(), static_cast<DWORD>(h.addr - base));
                 if (chosen == 0)
                     chosen = h.addr;
                 if (h.name == "DirectUI::Element::PaintBackground")
@@ -168,18 +213,35 @@ namespace
                 outStamp = diskStamp;
                 outSize  = diskSize;
                 wrote    = true;
-                std::printf("[dui] resolved rva=0x%08lX (dui70 stamp=%08lX size=%08lX)\n",
-                            outRva, diskStamp, diskSize);
+                Dbg(L"[dui] resolved rva=0x%08lX (dui70 stamp=%08lX size=%08lX)\n",
+                    outRva, diskStamp, diskSize);
             }
             else
             {
-                std::printf("[dui] DirectUI::Element::PaintBackground not found in symbols\n");
+                Dbg(L"[dui] DirectUI::Element::PaintBackground not found in symbols\n");
             }
             ::SymUnloadModule64(proc, base);
         }
 
         ::SymCleanup(proc);
         return wrote;
+    }
+
+    // Hand the resolved dui70 RVA to the payload via its exported setter (a shared section forwards
+    // it to every injected copy). Best-effort and silent: on any failure the payload simply runs
+    // without the DUI paint hook. Done BEFORE the hook is installed so the shared section is
+    // populated before any target maps the payload and reads it.
+    void HandOffDuiPaintBg()
+    {
+        const auto setDui = reinterpret_cast<void (*)(unsigned long, unsigned long, unsigned long)>(
+            ::GetProcAddress(g_hookModule, "UmbraSetDuiPaintBg"));
+        if (setDui == nullptr)
+            return;
+        DWORD rva = 0, stamp = 0, size = 0;
+        if (ResolveDuiPaintBgRva(rva, stamp, size))
+            setDui(rva, stamp, size);
+        else
+            Dbg(L"[dui] unresolved; payload runs WITHOUT the DUI paint hook.\n");
     }
 
     // Terminate explorer.exe so the still-pinned payload is dropped from the shell and the next
@@ -213,125 +275,198 @@ namespace
         }
         ::CloseHandle(snap);
 
-        if (bounced > 0)
-            std::printf("Bounced explorer.exe (%d); the shell auto-restarts clean.\n", bounced);
-        else
-            std::printf("explorer.exe not found; nothing to bounce.\n");
+        Dbg(bounced > 0 ? L"Bounced explorer.exe (%d); the shell auto-restarts clean.\n"
+                        : L"explorer.exe not found; nothing to bounce.\n", bounced);
     }
 
-    BOOL WINAPI ConsoleHandler(DWORD)
+    // --- Tray icon -----------------------------------------------------------
+    void AddTrayIcon(HWND hWnd)
     {
-        if (g_stop != nullptr)
-            ::SetEvent(g_stop);
-        return TRUE;
+        NOTIFYICONDATAW nid{};
+        nid.cbSize           = sizeof(nid);
+        nid.hWnd             = hWnd;
+        nid.uID              = kTrayIconId;
+        nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uCallbackMessage = kTrayCallback;
+        nid.hIcon            = g_trayIcon;
+        ::StringCchCopyW(nid.szTip, ARRAYSIZE(nid.szTip), L"WM_NIGHT");
+        ::Shell_NotifyIconW(NIM_ADD, &nid);
     }
 
-    void PumpUntilStop()
+    void RemoveTrayIcon(HWND hWnd)
     {
-        MSG msg{};
-        for (;;)
+        NOTIFYICONDATAW nid{};
+        nid.cbSize = sizeof(nid);
+        nid.hWnd   = hWnd;
+        nid.uID    = kTrayIconId;
+        ::Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+
+    void ShowTrayMenu(HWND hWnd)
+    {
+        HMENU menu = ::CreatePopupMenu();
+        if (menu == nullptr)
+            return;
+        ::AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings...");
+        ::AppendMenuW(menu, MF_STRING, IDM_ABOUT,    L"About...");
+        ::AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        ::AppendMenuW(menu, MF_STRING, IDM_EXIT,     L"Exit");
+        ::SetMenuDefaultItem(menu, IDM_SETTINGS, FALSE);
+
+        POINT pt{};
+        ::GetCursorPos(&pt);
+        // The foreground dance: make our window foreground so the menu dismisses when the user
+        // clicks elsewhere, and post a benign message afterward so it closes cleanly (the classic
+        // TrackPopupMenu tray-menu fix). TPM_RETURNCMD routes the choice back through WM_COMMAND.
+        ::SetForegroundWindow(hWnd);
+        const UINT cmd = static_cast<UINT>(::TrackPopupMenu(menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hWnd, nullptr));
+        ::PostMessageW(hWnd, WM_NULL, 0, 0);
+        ::DestroyMenu(menu);
+        if (cmd != 0)
+            ::SendMessageW(hWnd, WM_COMMAND, cmd, 0);
+    }
+
+    LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+    {
+        // Explorer (re)started: the taskbar was recreated, so re-add our icon. This broadcast only
+        // reaches top-level windows — which is why the tray owner is NOT an HWND_MESSAGE window.
+        if (msg == g_taskbarCreated && g_taskbarCreated != 0)
         {
-            const DWORD wait = ::MsgWaitForMultipleObjects(1, &g_stop, FALSE, INFINITE, QS_ALLINPUT);
-            if (wait == WAIT_OBJECT_0)
-                return;
-            if (wait != WAIT_OBJECT_0 + 1)
-                return;
-            while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
-            {
-                ::TranslateMessage(&msg);
-                ::DispatchMessageW(&msg);
-            }
+            AddTrayIcon(hWnd);
+            return 0;
         }
+
+        switch (msg)
+        {
+        case WM_CREATE:
+            AddTrayIcon(hWnd);
+            return 0;
+
+        case kTrayCallback:
+            switch (LOWORD(lParam))
+            {
+            case WM_LBUTTONDBLCLK:
+                ::SendMessageW(hWnd, WM_COMMAND, IDM_SETTINGS, 0);
+                break;
+            case WM_RBUTTONUP:
+            case WM_CONTEXTMENU:
+                ShowTrayMenu(hWnd);
+                break;
+            }
+            return 0;
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam))
+            {
+            case IDM_SETTINGS:
+                umbra::DarkMessageBox(hWnd, L"Settings are coming in a future version.",
+                                      L"WM_NIGHT - Settings", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            case IDM_ABOUT:
+                umbra::DarkMessageBox(hWnd,
+                    WMN_PRODUCT_NAME L"  " WMN_VERSION_STR L"\n"
+                    L"Native dark mode for the Windows desktop.\n\n"
+                    WMN_COPYRIGHT,
+                    L"About " WMN_PRODUCT_NAME, MB_OK | MB_ICONINFORMATION);
+                return 0;
+            case IDM_EXIT:
+                ::DestroyWindow(hWnd);
+                return 0;
+            }
+            return 0;
+
+        case WM_DESTROY:
+            RemoveTrayIcon(hWnd);
+            ::PostQuitMessage(0);
+            return 0;
+        }
+        return ::DefWindowProcW(hWnd, msg, wParam, lParam);
     }
 }
 
-int main()
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
 {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    g_hInst = hInstance;
+    ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("WM_NIGHT - dark-theming injection host\n");
-    std::printf("uiAccess: %s\n\n",
-                HasUiAccess() ? "granted" : "NO (run signed from a trusted path, or elevate)");
+    // Single instance: a second host would install a second global WH_CBT hook and double-inject
+    // the payload. The handle is intentionally kept for the process lifetime (freed on exit).
+    ::CreateMutexW(nullptr, FALSE, L"Local\\WM_NIGHT_singleton");
+    if (::GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0;
 
+    const INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
+    ::InitCommonControlsEx(&icc);
+    umbra::initDarkMode();   // app-wide dark opt-in (also darkens our popup menu + message boxes)
+
+    g_taskbarCreated = ::RegisterWindowMessageW(L"TaskbarCreated");
+
+    if (FAILED(::LoadIconMetric(hInstance, MAKEINTRESOURCEW(IDI_APPICON), LIM_SMALL, &g_trayIcon))
+        || g_trayIcon == nullptr)
+        g_trayIcon = ::LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInstance;
+    wc.lpszClassName = kWndClassName;
+    wc.hIcon         = ::LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
+    if (::RegisterClassExW(&wc) == 0)
+        return 1;
+
+    // Hidden, top-level (parent == nullptr) so it receives the TaskbarCreated broadcast; never
+    // shown, and WS_EX_TOOLWINDOW keeps it off the taskbar / Alt-Tab. WM_CREATE adds the icon.
+    g_hWnd = ::CreateWindowExW(WS_EX_TOOLWINDOW, kWndClassName, L"WM_NIGHT",
+                               WS_OVERLAPPED, 0, 0, 0, 0, nullptr, nullptr, hInstance, nullptr);
+    if (g_hWnd == nullptr)
+        return 1;
+
+    // Load the payload (the global hook injects THIS copy into each target).
     const std::wstring dllPath = ModuleDir() + L"\\WM_NIGHThook.dll";
-    HMODULE hookModule = ::LoadLibraryW(dllPath.c_str());
-    if (hookModule == nullptr)
+    g_hookModule = ::LoadLibraryW(dllPath.c_str());
+    if (g_hookModule == nullptr)
     {
-        std::fwprintf(stderr, L"LoadLibrary(%s) failed: %lu\n", dllPath.c_str(), ::GetLastError());
+        umbra::DarkMessageBox(g_hWnd, L"Could not load WM_NIGHThook.dll.",
+                              L"WM_NIGHT", MB_OK | MB_ICONERROR);
         return 1;
     }
 
-    const auto cbtProc = reinterpret_cast<HOOKPROC>(::GetProcAddress(hookModule, "UmbraCbtHook"));
+    const auto cbtProc = reinterpret_cast<HOOKPROC>(::GetProcAddress(g_hookModule, "UmbraCbtHook"));
     if (cbtProc == nullptr)
     {
-        std::fwprintf(stderr, L"GetProcAddress(UmbraCbtHook) failed: %lu\n", ::GetLastError());
-        ::FreeLibrary(hookModule);
+        umbra::DarkMessageBox(g_hWnd, L"WM_NIGHThook.dll is missing UmbraCbtHook.",
+                              L"WM_NIGHT", MB_OK | MB_ICONERROR);
+        ::FreeLibrary(g_hookModule);
         return 1;
     }
 
-    // Resolve dui70's Element::PaintBackground (symbols, once) and hand it to the payload via its
-    // exported setter — a shared section forwards it to every injected copy. Best-effort: on
-    // failure the payload just runs without the DUI paint hook. Do this BEFORE SetWindowsHookEx,
-    // so the shared section is populated before any target maps the payload and reads it.
-    if (const auto setDui = reinterpret_cast<void (*)(unsigned long, unsigned long, unsigned long)>(
-            ::GetProcAddress(hookModule, "UmbraSetDuiPaintBg")))
-    {
-        std::printf("[dui] resolving DirectUI::Element::PaintBackground"
-                    " (first run downloads dui70.pdb to logs\\symcache)...\n");
-        DWORD rva = 0, stamp = 0, size = 0;
-        if (ResolveDuiPaintBgRva(rva, stamp, size))
-            setDui(rva, stamp, size);
-        else
-            std::printf("[dui] unresolved; payload runs WITHOUT the DUI paint hook.\n");
-        std::printf("\n");
-    }
+    // Resolve dui70's Element::PaintBackground and hand it to the payload before the hook goes in.
+    HandOffDuiPaintBg();
 
-    g_stop = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (g_stop == nullptr)
+    g_cbtHook = ::SetWindowsHookExW(WH_CBT, cbtProc, g_hookModule, 0);
+    if (g_cbtHook == nullptr)
     {
-        ::FreeLibrary(hookModule);
-        return 1;
-    }
-    ::SetConsoleCtrlHandler(ConsoleHandler, TRUE);
-
-    const HHOOK cbtHook = ::SetWindowsHookExW(WH_CBT, cbtProc, hookModule, 0);
-    if (cbtHook == nullptr)
-    {
-        std::fwprintf(stderr, L"SetWindowsHookEx(WH_CBT) failed: %lu\n", ::GetLastError());
-        ::SetConsoleCtrlHandler(ConsoleHandler, FALSE);
-        ::CloseHandle(g_stop);
-        ::FreeLibrary(hookModule);
+        umbra::DarkMessageBox(g_hWnd, L"SetWindowsHookEx(WH_CBT) failed.",
+                              L"WM_NIGHT", MB_OK | MB_ICONERROR);
+        ::FreeLibrary(g_hookModule);
         return 1;
     }
 
-    std::printf("WH_CBT installed. Open regedit; its title bar should go dark.\n");
-    std::printf("Press Enter to unhook and exit.\n");
-
-    std::thread inputThread([]()
+    MSG msg{};
+    while (::GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
-        (void)std::getchar();
-        if (g_stop != nullptr)
-            ::SetEvent(g_stop);
-    });
+        ::TranslateMessage(&msg);
+        ::DispatchMessageW(&msg);
+    }
 
-    PumpUntilStop();
-
-    if (inputThread.joinable())
-        inputThread.detach();
-
-    ::UnhookWindowsHookEx(cbtHook);
-    ::SetConsoleCtrlHandler(ConsoleHandler, FALSE);
-    ::CloseHandle(g_stop);
-    g_stop = nullptr;
-
-    // Passive cleanup: the payload stays pinned in any process it themed (its subclasses
-    // self-remove on WM_NCDESTROY). We just release our own reference.
-    ::FreeLibrary(hookModule);
-    std::printf("Unhooked. Already-themed windows keep their theme until they close.\n");
-
-    // The CBT hook is down and our payload reference is released; now drop the copy still pinned
-    // in the shell by restarting it, so the next launch injects a fresh payload into a clean tree.
+    // Teardown (Exit / WM_QUIT). Mirrors the old console path: unhook, release our payload
+    // reference, then bounce explorer so the copy still pinned in the shell is dropped and the
+    // next launch injects a fresh payload into a clean tree.
+    ::UnhookWindowsHookEx(g_cbtHook);
+    ::FreeLibrary(g_hookModule);
+    if (g_trayIcon != nullptr)
+        ::DestroyIcon(g_trayIcon);
     BounceExplorer();
-    return 0;
+    return static_cast<int>(msg.wParam);
 }
