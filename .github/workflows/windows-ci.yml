@@ -1,0 +1,141 @@
+name: Windows CI
+
+# Build-tests both deliverable arches (amd64 + arm64) on every push/PR to master.
+# Mirrors the release build (msbuild + vcpkg manifest mode) minus signing/packaging, and
+# asserts the static-CRT invariant: neither the host nor the injected payload may import the
+# VC++ runtime DLLs (a payload that did couldn't inject into processes that lack them).
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows build test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            platform: x64
+            vcvars_arch: amd64
+          - arch: arm64
+            runner: windows-11-arm
+            platform: ARM64
+            vcvars_arch: arm64
+
+    concurrency:
+      group: windows-ci-${{ matrix.arch }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+
+    steps:
+      - name: Checkout WM_NIGHT
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read vcpkg baseline
+        id: vcpkg-baseline
+        run: |
+          # WM_NIGHT pins its baselines in vcpkg-configuration.json (the default registry and
+          # the WM_UMBRA registry that provides umbra), so read the default baseline from there.
+          $cfg = Get-Content -Raw vcpkg-configuration.json | ConvertFrom-Json
+          $baseline = $cfg.'default-registry'.baseline
+          if (-not $baseline) {
+            throw "vcpkg-configuration.json must define default-registry.baseline for CI."
+          }
+          "ref=$baseline" >> $env:GITHUB_OUTPUT
+
+      - name: Set vcpkg short root
+        run: |
+          $workspaceRoot = [System.IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+          if (-not $workspaceRoot) {
+            throw "Could not determine workspace drive from GITHUB_WORKSPACE='$env:GITHUB_WORKSPACE'."
+          }
+          $vcpkgRoot = Join-Path $workspaceRoot "v"
+          if (Test-Path $vcpkgRoot) {
+            throw "vcpkg short root already exists: $vcpkgRoot"
+          }
+          New-Item -ItemType Directory -Path $vcpkgRoot | Out-Null
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          Write-Host "Using VCPKG_ROOT=$vcpkgRoot"
+
+      - name: Checkout vcpkg
+        run: |
+          git clone --no-tags https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout --detach ${{ steps.vcpkg-baseline.outputs.ref }}
+
+      - name: Bootstrap vcpkg
+        run: |
+          $bootstrap = Join-Path $env:VCPKG_ROOT "bootstrap-vcpkg.bat"
+          & $bootstrap -disableMetrics
+
+      - name: Integrate vcpkg into MSBuild
+        run: |
+          # The .vcxproj rely on VcpkgEnabled=true + the per-user MSBuild props that
+          # `vcpkg integrate install` writes; without it msbuild won't restore the manifest.
+          & (Join-Path $env:VCPKG_ROOT "vcpkg.exe") integrate install
+
+      - name: Prepare vcpkg binary cache
+        run: New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v5
+        with:
+          path: vcpkg-cache
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ matrix.platform }}-
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release
+        run: |
+          # Unsigned: ARTIFACT_SIGNING_ENDPOINT is unset here, so the .vcxproj post-build sign
+          # target self-skips. (CI never signs; the release pipeline does.)
+          msbuild WM_NIGHT.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+
+      - name: Verify Windows artifacts
+        run: |
+          $out = ".\build\Release\${{ matrix.platform }}"
+          foreach ($f in @("$out\WM_NIGHT.exe", "$out\WM_NIGHThook.dll")) {
+            if (-not (Test-Path $f)) {
+              throw "Missing expected artifact: $f"
+            }
+          }
+
+      - name: Verify static dependency closure
+        run: |
+          $out = ".\build\Release\${{ matrix.platform }}"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -property installationPath
+          $vcvars = Join-Path $installPath "VC\Auxiliary\Build\vcvarsall.bat"
+          foreach ($bin in @("$out\WM_NIGHT.exe", "$out\WM_NIGHThook.dll")) {
+            $dump = & cmd.exe /d /s /c "call `"$vcvars`" ${{ matrix.vcvars_arch }} >nul && dumpbin /dependents `"$bin`""
+            $dump
+            # umbra + Detours are static libs (no DLL imports); with the /MT static CRT the VC
+            # runtime trio must not appear. The payload especially must be self-contained.
+            $blocked = $dump | Select-String -Pattern "VCRUNTIME|MSVCP|ucrtbase" -CaseSensitive:$false
+            if ($blocked) {
+              throw "$bin imports non-system runtime DLLs: $($blocked -join '; ')"
+            }
+          }

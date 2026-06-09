@@ -1,0 +1,68 @@
+name: Release (tag)
+
+# Auto-fires when a vW.X.Y.Z tag is pushed. The tag MUST match src/version.h (the single
+# version control point): the resolve job parses version.h, asserts the tag agrees, and also
+# checks WMN_VERSION_STR is in sync with the four numeric macros. Always drafts; publish via
+# `gh release edit --draft=false <tag>` or the UI's Publish button.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: compute
+        shell: bash
+        run: |
+          hdr="src/version.h"
+          get() { grep -oP "#define\s+$1\s+\K[0-9]+" "$hdr" | head -n1; }
+          maj=$(get WMN_VERSION_MAJOR); min=$(get WMN_VERSION_MINOR)
+          pat=$(get WMN_VERSION_PATCH); rev=$(get WMN_VERSION_REVISION)
+          if [[ -z "$maj" || -z "$min" || -z "$pat" || -z "$rev" ]]; then
+            echo "::error::Could not parse all four WMN_VERSION_* macros from $hdr"; exit 1
+          fi
+          hver="$maj.$min.$pat.$rev"
+          hstr=$(grep -oP '#define\s+WMN_VERSION_STR\s+L"\K[0-9.]+' "$hdr" | head -n1)
+          if [[ "$hstr" != "$hver" ]]; then
+            echo "::error::version.h desync: WMN_VERSION_STR=\"$hstr\" but the numeric macros are $hver. Make them match."; exit 1
+          fi
+          tag="${GITHUB_REF_NAME}"
+          tver="${tag#v}"
+          if [[ ! "$tver" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$tag' must be vW.X.Y.Z (four dot-separated integers)"; exit 1
+          fi
+          if [[ "$tver" != "$hver" ]]; then
+            echo "::error::Tag '$tag' (=> $tver) does not match src/version.h ($hver). Bump version.h to match, or tag v$hver."; exit 1
+          fi
+          echo "version=$hver" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$hver tag=$tag"
+
+  pipeline:
+    name: Build, sign, publish
+    needs: resolve
+    uses: ./.github/workflows/_release.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      draft: true
+    secrets: inherit

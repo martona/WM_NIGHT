@@ -1,0 +1,269 @@
+name: Release pipeline (reusable)
+
+# Build + sign + package (loose zip + MSIX) + archive symbols + attest + publish.
+# Invoked from release-tag.yml and release-manual.yml; not directly triggerable. Callers
+# parse the version from src/version.h (the single version control point) and pass
+# version/tag/draft in. Windows only (amd64 + arm64).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+        description: 'W.X.Y.Z (no v prefix), parsed from src/version.h by the caller'
+      tag:
+        required: true
+        type: string
+        description: 'Full tag name including v prefix (e.g. v0.1.0.0)'
+      draft:
+        required: true
+        type: boolean
+        description: 'Create the GitHub release as a draft (not published)'
+
+permissions:
+  contents: write       # create release + upload assets
+  id-token: write       # Azure OIDC for Trusted Signing + sigstore OIDC for attestation
+  attestations: write   # write build provenance attestation
+
+jobs:
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    # The release-signing environment scopes the OIDC token's `subject` claim to
+    # repo:martona/WM_NIGHT:environment:release-signing, which the Azure-side federated
+    # credential matches on.
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+            platform: x64
+            vcvars_arch: amd64
+          - arch: arm64
+            runner: windows-11-arm
+            platform: ARM64
+            vcvars_arch: arm64
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
+    steps:
+      - name: Checkout WM_NIGHT
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read vcpkg baseline
+        id: vcpkg-baseline
+        run: |
+          $cfg = Get-Content -Raw vcpkg-configuration.json | ConvertFrom-Json
+          $baseline = $cfg.'default-registry'.baseline
+          if (-not $baseline) {
+            throw "vcpkg-configuration.json must define default-registry.baseline for CI."
+          }
+          "ref=$baseline" >> $env:GITHUB_OUTPUT
+
+      - name: Set vcpkg short root
+        run: |
+          $workspaceRoot = [System.IO.Path]::GetPathRoot($env:GITHUB_WORKSPACE)
+          if (-not $workspaceRoot) {
+            throw "Could not determine workspace drive from GITHUB_WORKSPACE='$env:GITHUB_WORKSPACE'."
+          }
+          $vcpkgRoot = Join-Path $workspaceRoot "v"
+          if (Test-Path $vcpkgRoot) {
+            throw "vcpkg short root already exists: $vcpkgRoot"
+          }
+          New-Item -ItemType Directory -Path $vcpkgRoot | Out-Null
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          Write-Host "Using VCPKG_ROOT=$vcpkgRoot"
+
+      - name: Checkout vcpkg
+        run: |
+          git clone --no-tags https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git -C $env:VCPKG_ROOT checkout --detach ${{ steps.vcpkg-baseline.outputs.ref }}
+
+      - name: Bootstrap vcpkg
+        run: |
+          $bootstrap = Join-Path $env:VCPKG_ROOT "bootstrap-vcpkg.bat"
+          & $bootstrap -disableMetrics
+
+      - name: Integrate vcpkg into MSBuild
+        run: |
+          & (Join-Path $env:VCPKG_ROOT "vcpkg.exe") integrate install
+
+      - name: Prepare vcpkg binary cache
+        run: New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v5
+        with:
+          path: vcpkg-cache
+          key: ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ matrix.platform }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-vcpkg-${{ matrix.platform }}-
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release
+        run: |
+          # Build UNSIGNED here (ARTIFACT_SIGNING_ENDPOINT unset -> the .vcxproj sign target
+          # self-skips); the exe/dll and the MSIX are signed via Trusted Signing below.
+          msbuild WM_NIGHT.sln /m /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+
+      - name: Verify Windows artifacts
+        run: |
+          $out = ".\build\Release\${{ matrix.platform }}"
+          foreach ($f in @("$out\WM_NIGHT.exe", "$out\WM_NIGHThook.dll")) {
+            if (-not (Test-Path $f)) { throw "Missing expected artifact: $f" }
+          }
+
+      - name: Verify static dependency closure
+        run: |
+          $out = ".\build\Release\${{ matrix.platform }}"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -property installationPath
+          $vcvars = Join-Path $installPath "VC\Auxiliary\Build\vcvarsall.bat"
+          foreach ($bin in @("$out\WM_NIGHT.exe", "$out\WM_NIGHThook.dll")) {
+            $dump = & cmd.exe /d /s /c "call `"$vcvars`" ${{ matrix.vcvars_arch }} >nul && dumpbin /dependents `"$bin`""
+            $dump
+            $blocked = $dump | Select-String -Pattern "VCRUNTIME|MSVCP|ucrtbase" -CaseSensitive:$false
+            if ($blocked) {
+              throw "$bin imports non-system runtime DLLs: $($blocked -join '; ')"
+            }
+          }
+
+      # --- Signing (Azure Trusted Signing). The exe/dll are signed first because the MSIX
+      # step derives its manifest Publisher from the signed WM_NIGHT.exe. ---
+      - name: Azure login (Trusted Signing)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows artifacts
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\build\Release\${{ matrix.platform }}
+          files-folder-filter: exe,dll
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signatures
+        run: |
+          $out = ".\build\Release\${{ matrix.platform }}"
+          foreach ($f in @("$out\WM_NIGHT.exe", "$out\WM_NIGHThook.dll")) {
+              $sig = Get-AuthenticodeSignature $f
+              if ($sig.Status -ne 'Valid') {
+                  throw "Signature on $f is not Valid: $($sig.Status) — $($sig.StatusMessage)"
+              }
+              Write-Host "[+] $f signed by: $($sig.SignerCertificate.Subject)"
+          }
+
+      # MSIX runs AFTER the exe/dll are signed: the script reads the Publisher off the signed
+      # WM_NIGHT.exe and stages the signed binaries. Pack unsigned in Windows PowerShell (the
+      # logo downscaling uses System.Drawing), then sign the .msix with the same account.
+      - name: Package MSIX (unsigned)
+        shell: powershell
+        run: .\scripts\package_windows_msix.ps1 -Arch ${{ matrix.arch }} -Version "${{ inputs.version }}" -BuildDir "build\Release\${{ matrix.platform }}" -NoSign
+
+      - name: Sign MSIX
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE }}
+          files-folder: ${{ github.workspace }}\build\msix
+          files-folder-filter: msix
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify MSIX signature
+        run: |
+          $msix = ".\build\msix\wm_night-${{ inputs.version }}-${{ matrix.arch }}.msix"
+          $sig = Get-AuthenticodeSignature $msix
+          if ($sig.Status -ne 'Valid') {
+              throw "MSIX signature is not Valid: $($sig.Status) ($($sig.StatusMessage))"
+          }
+          Write-Host "[+] $msix signed by: $($sig.SignerCertificate.Subject)"
+
+      - name: Package artifacts
+        run: |
+          $ver = "${{ inputs.version }}"
+          $arch = "${{ matrix.arch }}"
+          $src = ".\build\Release\${{ matrix.platform }}"
+          $stage = ".\release-stage"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          # Installable assets are VERSION-LESS so docs can link a stable
+          # releases/latest/download/<name> URL (that redirect needs a constant filename).
+          # The version still rides in the embedded VERSIONINFO; the attestation binds by SHA256.
+          $binZip = Join-Path $stage "WM_NIGHT-windows-$arch.zip"
+          Compress-Archive -Path "$src\WM_NIGHT.exe","$src\WM_NIGHThook.dll" -DestinationPath $binZip
+          Write-Host "Created $binZip"
+
+          # Symbols stay VERSIONED -- build-tied debugging artifacts, never linked from docs.
+          $pdbs = @(Get-ChildItem -Path "$src\*.pdb")
+          if ($pdbs.Count -eq 0) {
+            throw "No PDBs found in $src — symbol shipment is required."
+          }
+          $pdbZip = Join-Path $stage "WM_NIGHT-$ver-windows-$arch-symbols.zip"
+          Compress-Archive -Path ($pdbs | ForEach-Object { $_.FullName }) -DestinationPath $pdbZip
+          Write-Host "Created $pdbZip with $($pdbs.Count) PDB(s)"
+
+          $msix = ".\build\msix\wm_night-$ver-$arch.msix"
+          if (-not (Test-Path $msix)) { throw "Signed MSIX not found: $msix" }
+          Copy-Item $msix (Join-Path $stage "WM_NIGHT-windows-$arch.msix")
+          Write-Host "Staged $msix"
+
+          Get-ChildItem $stage | Format-Table Name, Length
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: release-stage/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Create release
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          ls -la artifacts/
+          echo "Total: $(ls artifacts/ | wc -l) files"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: 'artifacts/*'
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          draft: ${{ inputs.draft }}
+          prerelease: false
+          generate_release_notes: true
+          files: artifacts/*
+          fail_on_unmatched_files: true

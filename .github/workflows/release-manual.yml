@@ -1,0 +1,65 @@
+name: Release (manual)
+
+# Operator-triggered release. The version comes from src/version.h (the single version
+# control point) — there is no version input to drift out of sync. Defaults to a draft; tick
+# `publish` to release immediately. Delegates the heavy lifting to _release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish immediately (otherwise creates a draft)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+      draft: ${{ steps.compute.outputs.draft }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - id: compute
+        shell: bash
+        run: |
+          hdr="src/version.h"
+          get() { grep -oP "#define\s+$1\s+\K[0-9]+" "$hdr" | head -n1; }
+          maj=$(get WMN_VERSION_MAJOR); min=$(get WMN_VERSION_MINOR)
+          pat=$(get WMN_VERSION_PATCH); rev=$(get WMN_VERSION_REVISION)
+          if [[ -z "$maj" || -z "$min" || -z "$pat" || -z "$rev" ]]; then
+            echo "::error::Could not parse all four WMN_VERSION_* macros from $hdr"; exit 1
+          fi
+          hver="$maj.$min.$pat.$rev"
+          hstr=$(grep -oP '#define\s+WMN_VERSION_STR\s+L"\K[0-9.]+' "$hdr" | head -n1)
+          if [[ "$hstr" != "$hver" ]]; then
+            echo "::error::version.h desync: WMN_VERSION_STR=\"$hstr\" but the numeric macros are $hver. Make them match."; exit 1
+          fi
+          if [[ "${{ inputs.publish }}" == "true" ]]; then draft="false"; else draft="true"; fi
+          echo "version=$hver" >> "$GITHUB_OUTPUT"
+          echo "tag=v$hver" >> "$GITHUB_OUTPUT"
+          echo "draft=$draft" >> "$GITHUB_OUTPUT"
+          echo "Resolved: version=$hver tag=v$hver draft=$draft"
+
+  pipeline:
+    name: Build, sign, publish
+    needs: resolve
+    uses: ./.github/workflows/_release.yml
+    with:
+      version: ${{ needs.resolve.outputs.version }}
+      tag: ${{ needs.resolve.outputs.tag }}
+      draft: ${{ needs.resolve.outputs.draft == 'true' }}
+    secrets: inherit
