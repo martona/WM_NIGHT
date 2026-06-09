@@ -32,9 +32,6 @@
 #include <strsafe.h>    // StringCch* helpers
 #include <dbghelp.h>    // symbol resolution for dui70's non-exported Element::PaintBackground
 #include <tlhelp32.h>   // process snapshot, to bounce explorer.exe on shutdown
-#include <netlistmgr.h> // Network List Manager: internet-connectivity change events (NCSI)
-#include <ocidl.h>      // IConnectionPoint / IConnectionPointContainer (the NLM event sink)
-#include <wrl/client.h> // Microsoft::WRL::ComPtr
 
 #include "umbra.h"      // dark-mode library (linked into the host for its own UI)
 #include "resource.h"
@@ -67,24 +64,6 @@ namespace
     bool      g_diagUiAccess   = false;
     bool      g_diagDuiOk      = false;
     DWORD     g_diagDuiRva     = 0;
-
-    // Background dui70-RVA resolver (worker thread + NLM connectivity retry; machinery further down).
-    using Microsoft::WRL::ComPtr;
-    using SetDuiFn = void (*)(unsigned long, unsigned long, unsigned long);
-    SetDuiFn  g_setDui    = nullptr;   // payload's UmbraSetDuiPaintBg, captured once
-    HANDLE    g_duiStop   = nullptr;   // manual-reset: ask the worker to stop (for a clean exit)
-    HANDLE    g_duiRetry  = nullptr;   // auto-reset:  NLM saw internet -> try the resolve again
-    HANDLE    g_duiThread = nullptr;   // the resolver worker thread
-
-    // dbghelp callback: cancels an in-flight symbol-server download the moment we're asked to stop,
-    // so exit is never held hostage by a wedged dui70.pdb fetch.
-    BOOL CALLBACK DuiSymCallback(HANDLE, ULONG action, ULONG64, ULONG64)
-    {
-        if (action == CBA_DEFERRED_SYMBOL_LOAD_CANCEL)
-            return (g_duiStop != nullptr && ::WaitForSingleObject(g_duiStop, 0) == WAIT_OBJECT_0)
-                       ? TRUE : FALSE;
-        return FALSE;
-    }
 
     // Did we actually receive uiAccess? (Only granted to a signed binary in a trusted path.)
     bool HasUiAccess()
@@ -148,13 +127,13 @@ namespace
     }
 
     // --- dui70 Element::PaintBackground RVA resolution (host-side) -----------
-    // The payload wants to hook DirectUI::Element::PaintBackground, a NON-exported member, in
-    // injected shell processes. We resolve it once HERE (a normal medium-IL process can talk to
-    // the Microsoft symbol server; a medium-IL DLL injected into an elevated target should not)
-    // and hand the payload only an RVA + the dui70 PE identity, through the DLL's exported
-    // UmbraSetDuiPaintBg() (a shared section forwards it to every injected copy). The payload adds
-    // the RVA to the live dui70 base (validating the identity first). Assumes a matching arch:
-    // build the host x64 to theme x64 shells (this box's case).
+    // The payload wants to hook DirectUI::Element::PaintBackground in injected shell processes.
+    // Turns out the member is EXPORTED by dui70.dll, so we resolve its RVA once HERE off the export
+    // table (no .pdb / symbol server / network needed — see ResolveDuiPaintBgRva) and hand the
+    // payload only an RVA + the dui70 PE identity, through the DLL's exported UmbraSetDuiPaintBg()
+    // (a shared section forwards it to every injected copy). The payload adds the RVA to the live
+    // dui70 base (validating the identity first). Assumes a matching arch: build the host x64 to
+    // theme x64 shells (this box's case).
 
     // dui70's TimeDateStamp + SizeOfImage off disk — the payload confirms its loaded copy matches
     // before trusting the RVA (a wrong RVA would crash on attach).
@@ -215,14 +194,6 @@ namespace
             dir.assign(p).append(L"\\WM_NIGHT");
         ::CoTaskMemFree(p);
         return dir;
-    }
-
-    // The dui70 symbol cache: a shipping host in a trusted (read-only) install path can't cache the
-    // downloaded dui70.pdb next to itself, so it lives under %LocalLow%.
-    std::wstring SymCacheDir()
-    {
-        const std::wstring base = LocalLowAppDir();
-        return base.empty() ? base : base + L"\\symcache";
     }
 
     // --- Payload staging (MSIX) ----------------------------------------------
@@ -290,6 +261,10 @@ namespace
         return staged.empty() ? inPackage : staged;
     }
 
+    // Resolve DirectUI::Element::PaintBackground's RVA in dui70.dll. The member is EXPORTED, so
+    // dbghelp finds it straight from the export table with an EMPTY symbol search path — no symbol
+    // server, no _NT_SYMBOL_PATH, no .pdb, no network. Offline and instant. We require the EXACT
+    // undecorated name (SYMOPT_UNDNAME); a looser/wildcard match could grab a wrong address.
     bool ResolveDuiPaintBgRva(DWORD& outRva, DWORD& outStamp, DWORD& outSize)
     {
         wchar_t dui[MAX_PATH];
@@ -305,55 +280,28 @@ namespace
             return false;
         }
 
-        const std::wstring cacheDir = SymCacheDir();
-        if (cacheDir.empty())
-        {
-            Dbg(L"[dui] no LocalLow path; skipping symbol resolution\n");
-            return false;
-        }
-        const int mk = ::SHCreateDirectoryExW(nullptr, cacheDir.c_str(), nullptr);
-        if (mk != ERROR_SUCCESS && mk != ERROR_ALREADY_EXISTS && mk != ERROR_FILE_EXISTS)
-            Dbg(L"[dui] could not create %ls (%d); symsrv may still proceed\n", cacheDir.c_str(), mk);
-
-        wchar_t symPath[1024];
-        ::StringCchPrintfW(symPath, ARRAYSIZE(symPath),
-            L"srv*%s*https://msdl.microsoft.com/download/symbols", cacheDir.c_str());
-
         const HANDLE proc = ::GetCurrentProcess();
-        ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
-        if (!::SymInitializeW(proc, symPath, FALSE))
+        ::SymSetOptions(SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+        if (!::SymInitializeW(proc, L"", FALSE))   // empty path: export table only, never the network
         {
             Dbg(L"[dui] SymInitialize failed: %lu\n", ::GetLastError());
             return false;
         }
-        ::SymRegisterCallbackW64(proc, DuiSymCallback, 0);   // so we can cancel the .pdb download on exit
 
         bool wrote = false;
         const DWORD64 base = ::SymLoadModuleExW(proc, nullptr, dui, nullptr, 0, 0, nullptr, 0);
         if (base == 0)
         {
-            Dbg(L"[dui] SymLoadModuleEx failed: %lu (symbols unreachable?)\n", ::GetLastError());
+            Dbg(L"[dui] SymLoadModuleEx failed: %lu\n", ::GetLastError());
         }
         else
         {
             std::vector<SymHit> hits;
-            // Exact scoped name first; widen if dbghelp's undecorated name is unscoped / overloaded.
             ::SymEnumSymbols(proc, base, "DirectUI::Element::PaintBackground", EnumSymProc, &hits);
-            //if (hits.empty())
-            //    ::SymEnumSymbols(proc, base, "*Element::PaintBackground", EnumSymProc, &hits);
-            //if (hits.empty())
-            //    ::SymEnumSymbols(proc, base, "*PaintBackground", EnumSymProc, &hits);
-
             DWORD64 chosen = 0;
             for (const SymHit& h : hits)
-            {
-                Dbg(L"[dui]   candidate %hs rva=0x%08lX\n",
-                    h.name.c_str(), static_cast<DWORD>(h.addr - base));
-                if (chosen == 0)
-                    chosen = h.addr;
                 if (h.name == "DirectUI::Element::PaintBackground")
-                    chosen = h.addr;   // prefer the exact scoped name over a wildcard hit
-            }
+                    chosen = h.addr;
 
             if (chosen != 0)
             {
@@ -361,12 +309,12 @@ namespace
                 outStamp = diskStamp;
                 outSize  = diskSize;
                 wrote    = true;
-                Dbg(L"[dui] resolved rva=0x%08lX (dui70 stamp=%08lX size=%08lX)\n",
+                Dbg(L"[dui] resolved (export) rva=0x%08lX (dui70 stamp=%08lX size=%08lX)\n",
                     outRva, diskStamp, diskSize);
             }
             else
             {
-                Dbg(L"[dui] DirectUI::Element::PaintBackground not found in symbols\n");
+                Dbg(L"[dui] DirectUI::Element::PaintBackground not found in dui70 exports\n");
             }
             ::SymUnloadModule64(proc, base);
         }
@@ -375,132 +323,24 @@ namespace
         return wrote;
     }
 
-    // Resolve the dui70 RVA and hand it to the payload (a shared section forwards it to every
-    // injected copy). The payload no-ops the paint hook until this lands and re-checks it lazily on
-    // window creation, so a LATE hand-off (after a download) still themes the next Control Panel open.
-    bool TryResolveAndHandOff()
+    // Resolve the dui70 RVA and hand it to the payload via UmbraSetDuiPaintBg (a shared section
+    // forwards it to every injected copy). Synchronous and instant — it's an export-table lookup, no
+    // network. Best-effort: on failure the payload simply runs without the DUI paint hook.
+    void HandOffDuiPaintBg()
     {
+        const auto setDui = reinterpret_cast<void (*)(unsigned long, unsigned long, unsigned long)>(
+            ::GetProcAddress(g_hookModule, "UmbraSetDuiPaintBg"));
+        if (setDui == nullptr)
+            return;
         DWORD rva = 0, stamp = 0, size = 0;
-        if (!ResolveDuiPaintBgRva(rva, stamp, size))
-            return false;
-        if (g_setDui != nullptr)
-            g_setDui(rva, stamp, size);
-        g_diagDuiRva = rva;
-        g_diagDuiOk  = true;
-        return true;
-    }
-
-    // Minimal INetworkListManagerEvents sink: pokes g_duiRetry when connectivity gains internet (the
-    // NCSI signal behind the tray globe). Stack-owned by the worker (which outlives the advise), so
-    // AddRef/Release never delete.
-    struct NlmSink : INetworkListManagerEvents
-    {
-        LONG refs = 1;
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+        if (ResolveDuiPaintBgRva(rva, stamp, size))
         {
-            if (riid == IID_IUnknown || riid == __uuidof(INetworkListManagerEvents))
-            {
-                *ppv = static_cast<INetworkListManagerEvents*>(this);
-                ::InterlockedIncrement(&refs);
-                return S_OK;
-            }
-            *ppv = nullptr;
-            return E_NOINTERFACE;
+            setDui(rva, stamp, size);
+            g_diagDuiRva = rva;
+            g_diagDuiOk  = true;
         }
-        ULONG STDMETHODCALLTYPE AddRef()  override { return ::InterlockedIncrement(&refs); }
-        ULONG STDMETHODCALLTYPE Release() override { return ::InterlockedDecrement(&refs); }
-        HRESULT STDMETHODCALLTYPE ConnectivityChanged(NLM_CONNECTIVITY c) override
-        {
-            if ((c & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0
-                && g_duiRetry != nullptr)
-                ::SetEvent(g_duiRetry);
-            return S_OK;
-        }
-    };
-
-    // Worker: resolve now (cache-first; downloads dui70.pdb if online). If that fails — typically no
-    // internet — park on NLM connectivity events and retry when internet returns. Cancelable via
-    // g_duiStop (both the wait and any in-flight download).
-    DWORD WINAPI DuiResolveWorker(LPVOID)
-    {
-        ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);   // MTA: NLM events arrive without a pump
-
-        // Resolve now; only stand up NLM if that failed AND we're not already being torn down (the
-        // first attempt's download may have just been cancelled by g_duiStop).
-        if (!TryResolveAndHandOff() && ::WaitForSingleObject(g_duiStop, 0) != WAIT_OBJECT_0)
-        {
-            ComPtr<INetworkListManager>       nlm;
-            ComPtr<IConnectionPointContainer> cpc;
-            ComPtr<IConnectionPoint>          cp;
-            NlmSink sink;
-            DWORD   cookie  = 0;
-            bool    advised = false;
-
-            if (SUCCEEDED(::CoCreateInstance(__uuidof(NetworkListManager), nullptr, CLSCTX_ALL,
-                                             IID_PPV_ARGS(&nlm)))
-                && SUCCEEDED(nlm.As(&cpc))
-                && SUCCEEDED(cpc->FindConnectionPoint(__uuidof(INetworkListManagerEvents), &cp))
-                && SUCCEEDED(cp->Advise(static_cast<INetworkListManagerEvents*>(&sink), &cookie)))
-            {
-                advised = true;
-                // If we're already online (so the first failure was transient, not offline), nudge
-                // one immediate retry — ConnectivityChanged only fires on TRANSITIONS.
-                NLM_CONNECTIVITY c = NLM_CONNECTIVITY_DISCONNECTED;
-                if (SUCCEEDED(nlm->GetConnectivity(&c))
-                    && (c & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0)
-                    ::SetEvent(g_duiRetry);
-
-                HANDLE waits[2] = { g_duiStop, g_duiRetry };
-                for (;;)
-                {
-                    const DWORD w = ::WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-                    if (w == WAIT_OBJECT_0 + 1)        // internet appeared -> retry
-                    {
-                        if (TryResolveAndHandOff())
-                            break;
-                    }
-                    else                                // g_duiStop, or a wait failure -> done
-                        break;
-                }
-            }
-            if (advised)
-                cp->Unadvise(cookie);
-        }
-
-        ::CoUninitialize();
-        return 0;
-    }
-
-    // Start the background resolver: capture the payload setter, then run the worker. The hook can
-    // install immediately afterward — the RVA lands whenever it lands.
-    void StartDuiResolver()
-    {
-        g_setDui = reinterpret_cast<SetDuiFn>(::GetProcAddress(g_hookModule, "UmbraSetDuiPaintBg"));
-        if (g_setDui == nullptr)
-            return;
-        g_duiStop  = ::CreateEventW(nullptr, TRUE,  FALSE, nullptr);
-        g_duiRetry = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (g_duiStop == nullptr || g_duiRetry == nullptr)
-            return;
-        g_duiThread = ::CreateThread(nullptr, 0, DuiResolveWorker, nullptr, 0, nullptr);
-    }
-
-    // Stop it for exit. Signals the worker (cancelling any in-flight download) and joins it briefly.
-    // Sets outFinished=false if it didn't exit in time (a wedged download), so the caller skips
-    // FreeLibrary and the setter can't race into a freed module — the process is ending regardless.
-    void StopDuiResolver(bool& outFinished)
-    {
-        outFinished = true;
-        if (g_duiStop != nullptr)
-            ::SetEvent(g_duiStop);
-        if (g_duiThread != nullptr)
-        {
-            outFinished = ::WaitForSingleObject(g_duiThread, 3000) == WAIT_OBJECT_0;
-            ::CloseHandle(g_duiThread);
-            g_duiThread = nullptr;
-        }
-        if (g_duiStop  != nullptr) { ::CloseHandle(g_duiStop);  g_duiStop  = nullptr; }
-        if (g_duiRetry != nullptr) { ::CloseHandle(g_duiRetry); g_duiRetry = nullptr; }
+        else
+            Dbg(L"[dui] unresolved; payload runs WITHOUT the DUI paint hook.\n");
     }
 
     // Terminate explorer.exe so the still-pinned payload is dropped from the shell and the next
@@ -749,7 +589,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     }
 
     // Resolve dui70's Element::PaintBackground and hand it to the payload before the hook goes in.
-    StartDuiResolver();   // resolve the dui70 RVA in the background (retries on connectivity); hook installs next
+    HandOffDuiPaintBg();   // resolve the dui70 RVA (export-table lookup: instant, offline) and hand it off
 
     g_cbtHook = ::SetWindowsHookExW(WH_CBT, cbtProc, g_hookModule, 0);
     if (g_cbtHook == nullptr)
@@ -779,11 +619,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     // reference, then bounce explorer so the copy still pinned in the shell is dropped and the
     // next launch injects a fresh payload into a clean tree.
     ::UnhookWindowsHookEx(g_cbtHook);
-    bool duiWorkerFinished = true;
-    StopDuiResolver(duiWorkerFinished);
-    if (duiWorkerFinished)
-        ::FreeLibrary(g_hookModule);   // else a wedged download is still running: leave our ref
-                                       // (process exit frees it) so it can't setDui into a freed module
+    ::FreeLibrary(g_hookModule);
     if (g_trayIcon != nullptr)
         ::DestroyIcon(g_trayIcon);
     BounceExplorer();
