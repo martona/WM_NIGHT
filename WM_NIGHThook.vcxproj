@@ -86,13 +86,14 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="WM_NIGHThook.cpp" />
+    <ClCompile Include="src\WM_NIGHThook.cpp" />
     <!-- The proven hook layer (was sample-hook; folded into WM_NIGHT): GetSysColor + uxtheme
          inline hooks, both compiled straight into the payload. -->
-    <ClCompile Include="ProcessColorHook.cpp" />
-    <ClCompile Include="ThemeColorHook.cpp" />
+    <ClCompile Include="src\ProcessColorHook.cpp" />
+    <ClCompile Include="src\ThemeColorHook.cpp" />
     <!-- dui70 DirectUI::Element::PaintBackground hook (host resolves its RVA via symbols). -->
-    <ClCompile Include="DuiPaintHook.cpp" />
+    <ClCompile Include="src\DuiPaintHook.cpp" />
+    <ClInclude Include="src\hook.h" />
   </ItemGroup>
 
   <!-- Build + link the umbra static library from ../WM_UMBRA (source, not vcpkg). CRT model
@@ -108,7 +109,7 @@
        next build. Before compiling, rename a still-locked previous copy aside (a mapped
        image can be renamed) so a fresh DLL links; sweep released asides. -->
   <Target Name="UnstickPayloadDll" BeforeTargets="ClCompile">
-    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\unstick-payload.ps1&quot; -Dll &quot;$(OutDir)WM_NIGHThook.dll&quot;"
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\scripts\unstick-payload.ps1&quot; -Dll &quot;$(OutDir)WM_NIGHThook.dll&quot;"
           ContinueOnError="true" />
   </Target>
 

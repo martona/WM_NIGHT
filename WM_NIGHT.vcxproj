@@ -85,7 +85,7 @@
   </ItemDefinitionGroup>
 
   <ItemGroup>
-    <ClCompile Include="WM_NIGHT.cpp" />
+    <ClCompile Include="src\WM_NIGHT.cpp" />
   </ItemGroup>
 
   <!-- Build the payload first (ordering only; the host LoadLibrary's it at runtime, so
