@@ -32,6 +32,9 @@
 #include <strsafe.h>    // StringCch* helpers
 #include <dbghelp.h>    // symbol resolution for dui70's non-exported Element::PaintBackground
 #include <tlhelp32.h>   // process snapshot, to bounce explorer.exe on shutdown
+#include <netlistmgr.h> // Network List Manager: internet-connectivity change events (NCSI)
+#include <ocidl.h>      // IConnectionPoint / IConnectionPointContainer (the NLM event sink)
+#include <wrl/client.h> // Microsoft::WRL::ComPtr
 
 #include "umbra.h"      // dark-mode library (linked into the host for its own UI)
 #include "resource.h"
@@ -64,6 +67,24 @@ namespace
     bool      g_diagUiAccess   = false;
     bool      g_diagDuiOk      = false;
     DWORD     g_diagDuiRva     = 0;
+
+    // Background dui70-RVA resolver (worker thread + NLM connectivity retry; machinery further down).
+    using Microsoft::WRL::ComPtr;
+    using SetDuiFn = void (*)(unsigned long, unsigned long, unsigned long);
+    SetDuiFn  g_setDui    = nullptr;   // payload's UmbraSetDuiPaintBg, captured once
+    HANDLE    g_duiStop   = nullptr;   // manual-reset: ask the worker to stop (for a clean exit)
+    HANDLE    g_duiRetry  = nullptr;   // auto-reset:  NLM saw internet -> try the resolve again
+    HANDLE    g_duiThread = nullptr;   // the resolver worker thread
+
+    // dbghelp callback: cancels an in-flight symbol-server download the moment we're asked to stop,
+    // so exit is never held hostage by a wedged dui70.pdb fetch.
+    BOOL CALLBACK DuiSymCallback(HANDLE, ULONG action, ULONG64, ULONG64)
+    {
+        if (action == CBA_DEFERRED_SYMBOL_LOAD_CANCEL)
+            return (g_duiStop != nullptr && ::WaitForSingleObject(g_duiStop, 0) == WAIT_OBJECT_0)
+                       ? TRUE : FALSE;
+        return FALSE;
+    }
 
     // Did we actually receive uiAccess? (Only granted to a signed binary in a trusted path.)
     bool HasUiAccess()
@@ -305,6 +326,7 @@ namespace
             Dbg(L"[dui] SymInitialize failed: %lu\n", ::GetLastError());
             return false;
         }
+        ::SymRegisterCallbackW64(proc, DuiSymCallback, 0);   // so we can cancel the .pdb download on exit
 
         bool wrote = false;
         const DWORD64 base = ::SymLoadModuleExW(proc, nullptr, dui, nullptr, 0, 0, nullptr, 0);
@@ -317,10 +339,10 @@ namespace
             std::vector<SymHit> hits;
             // Exact scoped name first; widen if dbghelp's undecorated name is unscoped / overloaded.
             ::SymEnumSymbols(proc, base, "DirectUI::Element::PaintBackground", EnumSymProc, &hits);
-            if (hits.empty())
-                ::SymEnumSymbols(proc, base, "*Element::PaintBackground", EnumSymProc, &hits);
-            if (hits.empty())
-                ::SymEnumSymbols(proc, base, "*PaintBackground", EnumSymProc, &hits);
+            //if (hits.empty())
+            //    ::SymEnumSymbols(proc, base, "*Element::PaintBackground", EnumSymProc, &hits);
+            //if (hits.empty())
+            //    ::SymEnumSymbols(proc, base, "*PaintBackground", EnumSymProc, &hits);
 
             DWORD64 chosen = 0;
             for (const SymHit& h : hits)
@@ -353,25 +375,132 @@ namespace
         return wrote;
     }
 
-    // Hand the resolved dui70 RVA to the payload via its exported setter (a shared section forwards
-    // it to every injected copy). Best-effort and silent: on any failure the payload simply runs
-    // without the DUI paint hook. Done BEFORE the hook is installed so the shared section is
-    // populated before any target maps the payload and reads it.
-    void HandOffDuiPaintBg()
+    // Resolve the dui70 RVA and hand it to the payload (a shared section forwards it to every
+    // injected copy). The payload no-ops the paint hook until this lands and re-checks it lazily on
+    // window creation, so a LATE hand-off (after a download) still themes the next Control Panel open.
+    bool TryResolveAndHandOff()
     {
-        const auto setDui = reinterpret_cast<void (*)(unsigned long, unsigned long, unsigned long)>(
-            ::GetProcAddress(g_hookModule, "UmbraSetDuiPaintBg"));
-        if (setDui == nullptr)
-            return;
         DWORD rva = 0, stamp = 0, size = 0;
-        if (ResolveDuiPaintBgRva(rva, stamp, size))
+        if (!ResolveDuiPaintBgRva(rva, stamp, size))
+            return false;
+        if (g_setDui != nullptr)
+            g_setDui(rva, stamp, size);
+        g_diagDuiRva = rva;
+        g_diagDuiOk  = true;
+        return true;
+    }
+
+    // Minimal INetworkListManagerEvents sink: pokes g_duiRetry when connectivity gains internet (the
+    // NCSI signal behind the tray globe). Stack-owned by the worker (which outlives the advise), so
+    // AddRef/Release never delete.
+    struct NlmSink : INetworkListManagerEvents
+    {
+        LONG refs = 1;
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
         {
-            setDui(rva, stamp, size);
-            g_diagDuiOk  = true;
-            g_diagDuiRva = rva;
+            if (riid == IID_IUnknown || riid == __uuidof(INetworkListManagerEvents))
+            {
+                *ppv = static_cast<INetworkListManagerEvents*>(this);
+                ::InterlockedIncrement(&refs);
+                return S_OK;
+            }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
         }
-        else
-            Dbg(L"[dui] unresolved; payload runs WITHOUT the DUI paint hook.\n");
+        ULONG STDMETHODCALLTYPE AddRef()  override { return ::InterlockedIncrement(&refs); }
+        ULONG STDMETHODCALLTYPE Release() override { return ::InterlockedDecrement(&refs); }
+        HRESULT STDMETHODCALLTYPE ConnectivityChanged(NLM_CONNECTIVITY c) override
+        {
+            if ((c & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0
+                && g_duiRetry != nullptr)
+                ::SetEvent(g_duiRetry);
+            return S_OK;
+        }
+    };
+
+    // Worker: resolve now (cache-first; downloads dui70.pdb if online). If that fails — typically no
+    // internet — park on NLM connectivity events and retry when internet returns. Cancelable via
+    // g_duiStop (both the wait and any in-flight download).
+    DWORD WINAPI DuiResolveWorker(LPVOID)
+    {
+        ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);   // MTA: NLM events arrive without a pump
+
+        // Resolve now; only stand up NLM if that failed AND we're not already being torn down (the
+        // first attempt's download may have just been cancelled by g_duiStop).
+        if (!TryResolveAndHandOff() && ::WaitForSingleObject(g_duiStop, 0) != WAIT_OBJECT_0)
+        {
+            ComPtr<INetworkListManager>       nlm;
+            ComPtr<IConnectionPointContainer> cpc;
+            ComPtr<IConnectionPoint>          cp;
+            NlmSink sink;
+            DWORD   cookie  = 0;
+            bool    advised = false;
+
+            if (SUCCEEDED(::CoCreateInstance(__uuidof(NetworkListManager), nullptr, CLSCTX_ALL,
+                                             IID_PPV_ARGS(&nlm)))
+                && SUCCEEDED(nlm.As(&cpc))
+                && SUCCEEDED(cpc->FindConnectionPoint(__uuidof(INetworkListManagerEvents), &cp))
+                && SUCCEEDED(cp->Advise(static_cast<INetworkListManagerEvents*>(&sink), &cookie)))
+            {
+                advised = true;
+                // If we're already online (so the first failure was transient, not offline), nudge
+                // one immediate retry — ConnectivityChanged only fires on TRANSITIONS.
+                NLM_CONNECTIVITY c = NLM_CONNECTIVITY_DISCONNECTED;
+                if (SUCCEEDED(nlm->GetConnectivity(&c))
+                    && (c & (NLM_CONNECTIVITY_IPV4_INTERNET | NLM_CONNECTIVITY_IPV6_INTERNET)) != 0)
+                    ::SetEvent(g_duiRetry);
+
+                HANDLE waits[2] = { g_duiStop, g_duiRetry };
+                for (;;)
+                {
+                    const DWORD w = ::WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+                    if (w == WAIT_OBJECT_0 + 1)        // internet appeared -> retry
+                    {
+                        if (TryResolveAndHandOff())
+                            break;
+                    }
+                    else                                // g_duiStop, or a wait failure -> done
+                        break;
+                }
+            }
+            if (advised)
+                cp->Unadvise(cookie);
+        }
+
+        ::CoUninitialize();
+        return 0;
+    }
+
+    // Start the background resolver: capture the payload setter, then run the worker. The hook can
+    // install immediately afterward — the RVA lands whenever it lands.
+    void StartDuiResolver()
+    {
+        g_setDui = reinterpret_cast<SetDuiFn>(::GetProcAddress(g_hookModule, "UmbraSetDuiPaintBg"));
+        if (g_setDui == nullptr)
+            return;
+        g_duiStop  = ::CreateEventW(nullptr, TRUE,  FALSE, nullptr);
+        g_duiRetry = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (g_duiStop == nullptr || g_duiRetry == nullptr)
+            return;
+        g_duiThread = ::CreateThread(nullptr, 0, DuiResolveWorker, nullptr, 0, nullptr);
+    }
+
+    // Stop it for exit. Signals the worker (cancelling any in-flight download) and joins it briefly.
+    // Sets outFinished=false if it didn't exit in time (a wedged download), so the caller skips
+    // FreeLibrary and the setter can't race into a freed module — the process is ending regardless.
+    void StopDuiResolver(bool& outFinished)
+    {
+        outFinished = true;
+        if (g_duiStop != nullptr)
+            ::SetEvent(g_duiStop);
+        if (g_duiThread != nullptr)
+        {
+            outFinished = ::WaitForSingleObject(g_duiThread, 3000) == WAIT_OBJECT_0;
+            ::CloseHandle(g_duiThread);
+            g_duiThread = nullptr;
+        }
+        if (g_duiStop  != nullptr) { ::CloseHandle(g_duiStop);  g_duiStop  = nullptr; }
+        if (g_duiRetry != nullptr) { ::CloseHandle(g_duiRetry); g_duiRetry = nullptr; }
     }
 
     // Terminate explorer.exe so the still-pinned payload is dropped from the shell and the next
@@ -620,7 +749,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     }
 
     // Resolve dui70's Element::PaintBackground and hand it to the payload before the hook goes in.
-    HandOffDuiPaintBg();
+    StartDuiResolver();   // resolve the dui70 RVA in the background (retries on connectivity); hook installs next
 
     g_cbtHook = ::SetWindowsHookExW(WH_CBT, cbtProc, g_hookModule, 0);
     if (g_cbtHook == nullptr)
@@ -650,7 +779,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     // reference, then bounce explorer so the copy still pinned in the shell is dropped and the
     // next launch injects a fresh payload into a clean tree.
     ::UnhookWindowsHookEx(g_cbtHook);
-    ::FreeLibrary(g_hookModule);
+    bool duiWorkerFinished = true;
+    StopDuiResolver(duiWorkerFinished);
+    if (duiWorkerFinished)
+        ::FreeLibrary(g_hookModule);   // else a wedged download is still running: leave our ref
+                                       // (process exit frees it) so it can't setDui into a freed module
     if (g_trayIcon != nullptr)
         ::DestroyIcon(g_trayIcon);
     BounceExplorer();
