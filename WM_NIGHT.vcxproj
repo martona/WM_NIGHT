@@ -42,13 +42,15 @@
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 
-  <!-- Points at the umbra library working copy (../WM_UMBRA): the host links umbra so its OWN
-       UI (tray popup menu, message boxes) follows dark mode. Still no Detours / vcpkg here — the
-       inline hooks (Detours) live only in the payload; the host needs just dbghelp for the
-       one-time dui70 symbol resolution. -->
-  <Import Project="WmUmbra.props" />
+  <!-- umbra (the dark-mode static lib) now comes from the WM_UMBRA vcpkg git registry, the same
+       way the payload gets Detours — see vcpkg.json / vcpkg-configuration.json. The host links
+       umbra so its OWN UI (tray popup menu, message boxes) follows dark mode; it still needs
+       dbghelp for the one-time dui70 symbol resolution. -->
   <PropertyGroup Label="Vcpkg">
-    <VcpkgEnabled>false</VcpkgEnabled>
+    <VcpkgEnabled>true</VcpkgEnabled>
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgUseStatic Condition="'$(UmbraCRT)'!='DLL'">true</VcpkgUseStatic>
+    <VcpkgUseStatic Condition="'$(UmbraCRT)'=='DLL'">false</VcpkgUseStatic>
   </PropertyGroup>
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"
@@ -69,7 +71,7 @@
       <!-- C++/WinRT projection headers (system XAML Islands) ship in the SDK; no NuGet needed.
            /EHsc is required by C++/WinRT. -->
       <ExceptionHandling>Sync</ExceptionHandling>
-      <AdditionalIncludeDirectories>$(WmUmbraDir)\include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\cppwinrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\cppwinrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -116,16 +118,13 @@
     <ClInclude Include="src\version.h" />
     <ClInclude Include="src\SettingsWindow.h" />
     <ClInclude Include="src\AboutDialog.h" />
+    <ClInclude Include="src\HostDiag.h" />
     <ClInclude Include="src\whitelist.h" />
   </ItemGroup>
 
   <!-- Build the payload first (ordering only; the host LoadLibrary's it at runtime, so
        no link dependency) — and so the sign step below sees both artifacts. -->
   <ItemGroup>
-    <!-- umbra static library (../WM_UMBRA): LINKED into the host for its own dark UI. -->
-    <ProjectReference Include="$(WmUmbraDir)\project\umbra.vcxproj">
-      <Project>{40E6196F-E54E-4BFF-8A94-449BB8E2E34F}</Project>
-    </ProjectReference>
     <ProjectReference Include="WM_NIGHThook.vcxproj">
       <Project>{3A9C7E15-8B2D-4F6A-9C1E-2D4F60718293}</Project>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>

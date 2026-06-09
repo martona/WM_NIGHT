@@ -18,11 +18,14 @@
     "version='6.0.0.0' processorArchitecture='*' "       \
     "publicKeyToken='6595b64144ccf1df' language='*'\"")
 
+#define _CRT_RAND_S      // enable rand_s (random staged-DLL name)
 #include <cstdarg>
+#include <cstdlib>       // rand_s
 #include <string>
 #include <vector>
 
 #include <windows.h>
+#include <appmodel.h>   // GetCurrentPackageFullName (detect MSIX packaging)
 #include <shellapi.h>   // Shell_NotifyIcon / NOTIFYICONDATA (tray icon)
 #include <commctrl.h>   // LoadIconMetric, InitCommonControlsEx
 #include <shlobj.h>     // SHGetKnownFolderPath, SHCreateDirectoryExW
@@ -35,12 +38,14 @@
 #include "version.h"
 #include "SettingsWindow.h"   // XAML-Islands Settings window
 #include "AboutDialog.h"      // About box (Win32 dialog)
+#include "HostDiag.h"         // startup diagnostics shown in the Settings window
 
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")   // registry: autostart + single-instance
+#pragma comment(lib, "umbra.lib")      // dark-mode library (vcpkg: WM_UMBRA git registry)
 
 namespace
 {
@@ -54,6 +59,24 @@ namespace
     HHOOK     g_cbtHook        = nullptr;
     HICON     g_trayIcon       = nullptr;
     UINT      g_taskbarCreated = 0;         // RegisterWindowMessage("TaskbarCreated")
+
+    // Startup-diagnostics snapshot, surfaced in the Settings window via the HostDiag accessors.
+    bool      g_diagUiAccess   = false;
+    bool      g_diagDuiOk      = false;
+    DWORD     g_diagDuiRva     = 0;
+
+    // Did we actually receive uiAccess? (Only granted to a signed binary in a trusted path.)
+    bool HasUiAccess()
+    {
+        HANDLE token = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token))
+            return false;
+        DWORD uiAccess = 0, returned = 0;
+        const bool ok = ::GetTokenInformation(token, TokenUIAccess, &uiAccess,
+                                              sizeof(uiAccess), &returned) != FALSE && uiAccess != 0;
+        ::CloseHandle(token);
+        return ok;
+    }
 
     // Diagnostics now go to the debugger — a GUI-subsystem app has no console. All of this is
     // best-effort: uiAccess is assumed to work, and the dui70 resolve below may fail silently.
@@ -156,10 +179,10 @@ namespace
         return TRUE;
     }
 
-    // The dui70 symbol cache lives under %LocalLow%: a shipping host in a trusted (read-only)
-    // install path can't cache the downloaded dui70.pdb next to itself, and LocalLow is the
-    // per-user, low-trust spot meant for exactly this kind of throwaway downloaded data.
-    std::wstring SymCacheDir()
+    // %LocalLow%\WM_NIGHT — our per-user data dir. Under MSIX, filesystem write-virtualization is
+    // disabled (see the AppxManifest), so writes here hit the REAL path — which OUT-of-package
+    // targets (explorer/regedit) can read. That is what makes the staged payload DLL reachable.
+    std::wstring LocalLowAppDir()
     {
         // FOLDERID_LocalLow = {A520A1A4-1780-4FF6-BD18-167343C5AF16}, spelled out so we don't
         // depend on the KnownFolders.h GUID export (absent in this SDK include config).
@@ -168,9 +191,82 @@ namespace
         PWSTR p = nullptr;
         std::wstring dir;
         if (SUCCEEDED(::SHGetKnownFolderPath(localLow, 0, nullptr, &p)) && p != nullptr)
-            dir.assign(p).append(L"\\WM_NIGHT\\symcache");
+            dir.assign(p).append(L"\\WM_NIGHT");
         ::CoTaskMemFree(p);
         return dir;
+    }
+
+    // The dui70 symbol cache: a shipping host in a trusted (read-only) install path can't cache the
+    // downloaded dui70.pdb next to itself, so it lives under %LocalLow%.
+    std::wstring SymCacheDir()
+    {
+        const std::wstring base = LocalLowAppDir();
+        return base.empty() ? base : base + L"\\symcache";
+    }
+
+    // --- Payload staging (MSIX) ----------------------------------------------
+    // A packaged host's WM_NIGHThook.dll lives in WindowsApps, which the injected targets cannot
+    // read — so a global hook installed from it never lands. We copy it to real %LocalLow% (which
+    // those targets CAN read) and hook from there. The copy takes a RANDOM name because a hook DLL
+    // stays mapped — and the file stays locked — in any target still running from a prior session;
+    // a fresh name dodges that lock instead of fighting it.
+    bool IsPackaged()
+    {
+        UINT32 len = 0;
+        return ::GetCurrentPackageFullName(&len, nullptr) != APPMODEL_ERROR_NO_PACKAGE;
+    }
+
+    // Best-effort sweep of previously staged copies. Ones still mapped in a live target fail to
+    // delete (locked) and are simply left for a future run.
+    void SweepStagedDlls(const std::wstring& dir)
+    {
+        WIN32_FIND_DATAW fd{};
+        const std::wstring pattern = dir + L"\\WM_NIGHThook.*.dll";
+        const HANDLE h = ::FindFirstFileW(pattern.c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE)
+            return;
+        do
+        {
+            const std::wstring f = dir + L"\\" + fd.cFileName;
+            ::DeleteFileW(f.c_str());
+        } while (::FindNextFileW(h, &fd));
+        ::FindClose(h);
+    }
+
+    // Copy the in-package payload to %LocalLow%\WM_NIGHT\WM_NIGHThook.<rand>.dll; returns that path,
+    // or empty on failure (the caller then falls back to the in-package DLL).
+    std::wstring StagePayloadDll(const std::wstring& source)
+    {
+        const std::wstring dir = LocalLowAppDir();
+        if (dir.empty())
+            return {};
+        ::SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
+        SweepStagedDlls(dir);
+
+        unsigned int r = 0;
+        if (::rand_s(&r) != 0)
+            r = ::GetTickCount();   // fallback; the name only needs to be unlikely to hit a lock
+        wchar_t name[64];
+        ::StringCchPrintfW(name, ARRAYSIZE(name), L"WM_NIGHThook.%010u.dll", r);
+        const std::wstring dest = dir + L"\\" + name;
+
+        if (!::CopyFileW(source.c_str(), dest.c_str(), FALSE))
+        {
+            Dbg(L"[stage] CopyFile to %ls failed: %lu\n", dest.c_str(), ::GetLastError());
+            return {};
+        }
+        return dest;
+    }
+
+    // Where to LoadLibrary the payload from. Loose build: next to the exe (already target-readable).
+    // Packaged build: a staged copy in %LocalLow% (the WindowsApps copy isn't target-readable).
+    std::wstring ResolvePayloadDllPath()
+    {
+        const std::wstring inPackage = ModuleDir() + L"\\WM_NIGHThook.dll";
+        if (!IsPackaged())
+            return inPackage;
+        const std::wstring staged = StagePayloadDll(inPackage);
+        return staged.empty() ? inPackage : staged;
     }
 
     bool ResolveDuiPaintBgRva(DWORD& outRva, DWORD& outStamp, DWORD& outSize)
@@ -269,7 +365,11 @@ namespace
             return;
         DWORD rva = 0, stamp = 0, size = 0;
         if (ResolveDuiPaintBgRva(rva, stamp, size))
+        {
             setDui(rva, stamp, size);
+            g_diagDuiOk  = true;
+            g_diagDuiRva = rva;
+        }
         else
             Dbg(L"[dui] unresolved; payload runs WITHOUT the DUI paint hook.\n");
     }
@@ -411,6 +511,37 @@ namespace
     }
 }
 
+// --- Settings-window diagnostics (declared in HostDiag.h; defined here so they can read the host
+// state above). Each returns a single small-print line. -----------------------------------------
+std::wstring DiagDllLine()
+{
+    if (g_hookModule == nullptr)
+        return L"WM_NIGHThook.dll: NOT loaded";
+    const auto ver = reinterpret_cast<unsigned long (*)()>(
+        ::GetProcAddress(g_hookModule, "UmbraHookVersion"));
+    if (ver == nullptr)
+        return L"WM_NIGHThook.dll: loaded (no version export)";
+    const unsigned long v = ver();
+    wchar_t buf[64];
+    ::wsprintfW(buf, L"WM_NIGHThook.dll: loaded  v%lu.%lu.%lu.%lu",
+                (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+    return buf;
+}
+
+std::wstring DiagUiAccessLine()
+{
+    return g_diagUiAccess ? L"uiAccess: granted" : L"uiAccess: NOT granted";
+}
+
+std::wstring DiagDuiLine()
+{
+    if (!g_diagDuiOk)
+        return L"dui70 RVA: unresolved";
+    wchar_t buf[64];
+    ::wsprintfW(buf, L"dui70 RVA: 0x%08lX (ok)", g_diagDuiRva);
+    return buf;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
 {
     // Safety hatch: holding Shift while we start (e.g. at logon) makes us exit silently BEFORE
@@ -468,8 +599,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     if (g_hWnd == nullptr)
         return 1;
 
-    // Load the payload (the global hook injects THIS copy into each target).
-    const std::wstring dllPath = ModuleDir() + L"\\WM_NIGHThook.dll";
+    // Load the payload (the global hook injects THIS copy into each target). Packaged builds stage
+    // it to %LocalLow% first, since the in-package WindowsApps copy isn't readable by the targets.
+    const std::wstring dllPath = ResolvePayloadDllPath();
     g_hookModule = ::LoadLibraryW(dllPath.c_str());
     if (g_hookModule == nullptr)
     {
@@ -498,6 +630,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
         ::FreeLibrary(g_hookModule);
         return 1;
     }
+
+    g_diagUiAccess = HasUiAccess();   // snapshot for the Settings diagnostics readout
 
     // A manual launch (no /tray) opens Settings immediately; autostart stays quiet in the tray.
     if (!trayMode)

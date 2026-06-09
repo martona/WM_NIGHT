@@ -1,0 +1,15 @@
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "10ceb139a610ebf3c6aa49cdc4a4b7f3db5d3f2b"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/martona/WM_UMBRA",
+      "baseline": "206822a27974256728404cf612ebc8ac72d1f9e5",
+      "packages": [ "umbra" ]
+    }
+  ]
+}

@@ -29,6 +29,9 @@
 #include <DarkMode.h>
 #include "hook.h"      // setProcessWideColorHook / setProcessWideThemeColorHook (sample-hook)
 #include "whitelist.h" // registry-backed target whitelist (shared with the host)
+#include "version.h"   // WMN_VERSION_* for the UmbraHookVersion export
+
+#pragma comment(lib, "umbra.lib")   // dark-mode library (vcpkg: WM_UMBRA git registry)
 
 namespace
 {
@@ -381,6 +384,17 @@ LRESULT CALLBACK UmbraCbtHook(int code, WPARAM wParam, LPARAM lParam)
         EnsureDuiPaintHook();   // attaches when dui70 (lazily) loads — e.g. Control Panel opens
     }
     return ::CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+// Build version of this payload, packed as (major<<24)|(minor<<16)|(patch<<8)|revision, so the
+// host can confirm it loaded the MATCHING DLL and surface it in the Settings diagnostics.
+// extern "C" -> undecorated export name on x64.
+extern "C" __declspec(dllexport) unsigned long UmbraHookVersion() noexcept
+{
+    return (static_cast<unsigned long>(WMN_VERSION_MAJOR) << 24)
+         | (static_cast<unsigned long>(WMN_VERSION_MINOR) << 16)
+         | (static_cast<unsigned long>(WMN_VERSION_PATCH) << 8)
+         |  static_cast<unsigned long>(WMN_VERSION_REVISION);
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)

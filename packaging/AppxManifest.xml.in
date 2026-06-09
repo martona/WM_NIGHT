@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  MSIX manifest template for the packaged (full-trust Win32) build of WM_NIGHT.
+  @TOKENS@ are substituted by scripts/package_windows_msix.ps1.
+
+  Two WM_NIGHT-specific declarations, both restricted capabilities (see memory
+  wm-night-msix-blockers for the research):
+
+    * rescap:uiAccess  -> keeps uiAccess working in the package. WM_NIGHT.exe already
+      carries uiAccess=true in its embedded (linker) manifest; the MS docs require this
+      capability to be declared whenever requestedExecutionLevel uiAccess=true. With it,
+      the packaged app can still reach elevated targets (regedit/mmc) — no separate
+      non-uiAccess build needed.
+
+    * rescap:unvirtualizedResources + desktop6:RegistryWriteVirtualization=disabled ->
+      turns OFF HKCU write virtualization so the host's registry writes land in the REAL
+      HKCU, "visible to other processes outside the package." That is what lets the
+      injected WM_NIGHThook.dll (running in UNPACKAGED explorer/regedit) actually read the
+      whitelist, and lets the HKCU\...\Run autostart reach the logon scan. Same registry
+      code works packaged and loose — no refactor.
+
+  DISTRIBUTION CAVEAT: both are RESTRICTED capabilities. Sideloading a SIGNED package is
+  fine; the Microsoft Store requires approval for restricted capabilities. unvirtualizedResources
+  is reportedly install-constrained (PowerShell Add-AppxPackage + developer mode; AppInstaller/
+  double-click may refuse) — verify for your distribution path before relying on it.
+
+  WM_NIGHThook.dll is staged alongside WM_NIGHT.exe (the host LoadLibrary's it at runtime);
+  it needs no manifest entry.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop6 rescap">
+
+  <Identity
+    Name="@IDENTITY_NAME@"
+    Publisher="@PUBLISHER@"
+    Version="@VERSION@"
+    ProcessorArchitecture="@ARCH@" />
+
+  <Properties>
+    <DisplayName>WM_NIGHT</DisplayName>
+    <PublisherDisplayName>@PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
+    <Logo>Images\StoreLogo.png</Logo>
+    <!-- HKCU writes go to the REAL hive so the injected DLL (outside the package) sees them. -->
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+    <!-- AppData writes go to the REAL filesystem too, so a payload DLL staged under %LocalLow%
+         lands where the injected targets can read it, not in the package's private store. -->
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+  </Properties>
+
+  <Dependencies>
+    <!-- 18362: system XAML Islands (Settings) + unvirtualizedResources both need Win10 1903+. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.18362.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="uiAccess" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="WMNIGHT" Executable="WM_NIGHT.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="WM_NIGHT"
+        Description="Native dark mode for classic Win32 desktop apps."
+        BackgroundColor="#1B1B2A"
+        Square150x150Logo="Images\Square150x150Logo.png"
+        Square44x44Logo="Images\Square44x44Logo.png">
+        <uap:DefaultTile Square71x71Logo="Images\Square71x71Logo.png" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+</Package>

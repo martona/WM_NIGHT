@@ -42,12 +42,9 @@
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 
-  <!-- One place that points at the umbra library working copy (../WM_UMBRA), consumed from
-       source via project reference rather than vcpkg during the transition. -->
-  <Import Project="WmUmbra.props" />
-
-  <!-- The hook layer (ProcessColorHook/ThemeColorHook) inline-hooks GetSysColor/uxtheme
-       via Detours; pull it in through vcpkg manifest mode (static triplet for /MT). -->
+  <!-- The hook layer (ProcessColorHook/ThemeColorHook) inline-hooks GetSysColor/uxtheme via
+       Detours, plus the umbra static library; both come through vcpkg manifest mode (static
+       triplet for /MT). See vcpkg.json / vcpkg-configuration.json (umbra = WM_UMBRA git registry). -->
   <PropertyGroup Label="Vcpkg">
     <VcpkgEnabled>true</VcpkgEnabled>
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
@@ -73,7 +70,6 @@
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(WmUmbraDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug' and '$(UmbraCRT)'=='DLL'">MultiThreadedDebugDLL</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'=='Debug' and '$(UmbraCRT)'!='DLL'">MultiThreadedDebug</RuntimeLibrary>
       <RuntimeLibrary Condition="'$(Configuration)'=='Release' and '$(UmbraCRT)'=='DLL'">MultiThreadedDLL</RuntimeLibrary>
@@ -97,14 +93,6 @@
     <ClCompile Include="src\whitelist.cpp" />
     <ClInclude Include="src\hook.h" />
     <ClInclude Include="src\whitelist.h" />
-  </ItemGroup>
-
-  <!-- Build + link the umbra static library from ../WM_UMBRA (source, not vcpkg). CRT model
-       matches via the static-CRT settings above. -->
-  <ItemGroup>
-    <ProjectReference Include="$(WmUmbraDir)\project\umbra.vcxproj">
-      <Project>{40E6196F-E54E-4BFF-8A94-449BB8E2E34F}</Project>
-    </ProjectReference>
   </ItemGroup>
 
   <!-- A global WH_CBT DLL lingers, still mapped, in target processes until they pump a

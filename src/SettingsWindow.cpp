@@ -13,6 +13,7 @@
 #include "SettingsWindow.h"
 #include "resource.h"
 #include "whitelist.h"
+#include "HostDiag.h"
 
 // winuser.h defines GetCurrentTime as a macro (-> GetTickCount), which collides with a XAML method
 // of the same name in the cppwinrt animation headers (warning C4002). Drop it before they load.
@@ -428,10 +429,25 @@ namespace
         Button add;
         add.Content(box_value(hstring(L"Add…")));
         add.HorizontalAlignment(HorizontalAlignment::Left);
+        add.VerticalAlignment(VerticalAlignment::Bottom);
         add.Margin(ThicknessHelper::FromLengths(24, 8, 24, 24));
         add.Click([](Windows::Foundation::IInspectable const&, RoutedEventArgs const&) { OnAddClicked(); });
         Grid::SetRow(add, 3);
         root.Children().Append(add);
+
+        // Small-print startup diagnostics, bottom-right, across from the Add button (3 lines,
+        // right-justified). Snapshot from the host taken at startup; selectable so it can be copied.
+        TextBlock diag;
+        diag.Text(hstring(DiagDllLine() + L"\n" + DiagUiAccessLine() + L"\n" + DiagDuiLine()));
+        diag.FontSize(11);
+        diag.Opacity(0.6);
+        diag.IsTextSelectionEnabled(true);
+        diag.TextAlignment(TextAlignment::Right);
+        diag.HorizontalAlignment(HorizontalAlignment::Right);
+        diag.VerticalAlignment(VerticalAlignment::Bottom);
+        diag.Margin(ThicknessHelper::FromLengths(24, 8, 24, 24));
+        Grid::SetRow(diag, 3);
+        root.Children().Append(diag);
 
         ApplyXamlTheme();   // initial light/dark to match the system
         RefreshList();
