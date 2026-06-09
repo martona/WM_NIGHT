@@ -33,6 +33,7 @@
 #include "umbra.h"      // dark-mode library (linked into the host for its own UI)
 #include "resource.h"
 #include "version.h"
+#include "SettingsWindow.h"   // XAML-Islands Settings window
 
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -360,8 +361,7 @@ namespace
             switch (LOWORD(wParam))
             {
             case IDM_SETTINGS:
-                umbra::DarkMessageBox(hWnd, L"Settings are coming in a future version.",
-                                      L"WM_NIGHT - Settings", MB_OK | MB_ICONINFORMATION);
+                ShowSettingsWindow(g_hInst);
                 return 0;
             case IDM_ABOUT:
                 umbra::DarkMessageBox(hWnd,
@@ -399,6 +399,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     const INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
     ::InitCommonControlsEx(&icc);
     umbra::initDarkMode();   // app-wide dark opt-in (also darkens our popup menu + message boxes)
+    SettingsInit();          // COM apartment (STA) for the XAML-Islands Settings window
 
     g_taskbarCreated = ::RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -456,6 +457,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
     MSG msg{};
     while (::GetMessageW(&msg, nullptr, 0, 0) > 0)
     {
+        if (SettingsPreTranslateMessage(&msg))   // let an open XAML island consume keyboard/focus
+            continue;
         ::TranslateMessage(&msg);
         ::DispatchMessageW(&msg);
     }

@@ -66,7 +66,10 @@
       <WarningLevel>Level4</WarningLevel>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>$(WmUmbraDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- C++/WinRT projection headers (system XAML Islands) ship in the SDK; no NuGet needed.
+           /EHsc is required by C++/WinRT. -->
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <AdditionalIncludeDirectories>$(WmUmbraDir)\include;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\cppwinrt;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -90,10 +93,17 @@
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Release'">NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ResourceCompile>
+    <!-- Merge a compatibility/maxversiontested fragment (XAML Islands needs it) into the linker's
+         UAC manifest. Fragment-only (no trustInfo), so mt.exe merges it without the UAC clash. -->
+    <Manifest>
+      <AdditionalManifestFiles>src\WM_NIGHT.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
   </ItemDefinitionGroup>
 
   <ItemGroup>
     <ClCompile Include="src\WM_NIGHT.cpp" />
+    <ClCompile Include="src\SettingsWindow.cpp" />
+    <ClCompile Include="src\whitelist.cpp" />
   </ItemGroup>
 
   <ItemGroup>
@@ -103,6 +113,8 @@
   <ItemGroup>
     <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\version.h" />
+    <ClInclude Include="src\SettingsWindow.h" />
+    <ClInclude Include="src\whitelist.h" />
   </ItemGroup>
 
   <!-- Build the payload first (ordering only; the host LoadLibrary's it at runtime, so

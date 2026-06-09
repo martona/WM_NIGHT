@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    Compatibility / maxversiontested. REQUIRED for the system XAML Hosting API (XAML Islands) in an
+    UNPACKAGED desktop app: WindowsXamlManager::InitializeForCurrentThread() refuses to run without
+    it. This is a FRAGMENT — it carries ONLY the compatibility section (no trustInfo), so mt.exe
+    merges it with the linker-generated UAC/uiAccess manifest (EnableUAC/UACUIAccess) with no clash.
+  -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Highest OS version tested; gates the WinRT/XAML feature quirk level. -->
+      <maxversiontested Id="10.0.26100.0"/>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

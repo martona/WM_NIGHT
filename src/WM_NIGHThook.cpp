@@ -27,13 +27,15 @@
 
 #include <umbra.h>
 #include <DarkMode.h>
-#include "hook.h"   // setProcessWideColorHook / setProcessWideThemeColorHook (sample-hook)
+#include "hook.h"      // setProcessWideColorHook / setProcessWideThemeColorHook (sample-hook)
+#include "whitelist.h" // registry-backed target whitelist (shared with the host)
 
 namespace
 {
     bool          g_isTarget = false;                 // are we inside a whitelisted process?
     HMODULE       g_self     = nullptr;               // this DLL (for SetWindowsHookEx hMod)
     INIT_ONCE     g_initOnce = INIT_ONCE_STATIC_INIT; // once-per-process umbra + inline-hook init
+    INIT_ONCE     g_targetOnce = INIT_ONCE_STATIC_INIT; // once-per-process whitelist eval (g_isTarget)
     volatile LONG g_pinned   = 0;                     // module self-pin latch
 
     thread_local bool t_threadHooked = false;         // CALLWNDPROC[RET] installed on this thread?
@@ -77,34 +79,16 @@ namespace
     }
     // ------------------------------------------------------------------------------------
 
-    const wchar_t* BaseName(const wchar_t* path) noexcept
-    {
-        const wchar_t* base = path;
-        for (const wchar_t* p = path; *p != L'\0'; ++p)
-            if (*p == L'\\' || *p == L'/')
-                base = p + 1;
-        return base;
-    }
-
-    bool SameI(const wchar_t* a, const wchar_t* b) noexcept
-    {
-        return a != nullptr && b != nullptr &&
-               ::CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
-    }
-
-    void InitProcessFlags() noexcept
+    // Decide ONCE per process whether we're a whitelisted target. Reads the registry whitelist
+    // (HKCU\Software\WM_NIGHT\Targets, full-path match; unconfigured => explorer + regedit), which
+    // replaced the old hardcoded exe-name list. Runs on the first CBT fire — deliberately NOT in
+    // DllMain, since registry I/O (advapi32) must not happen under the loader lock.
+    BOOL CALLBACK EvalTargetOnce(PINIT_ONCE, PVOID, PVOID*) noexcept
     {
         wchar_t path[MAX_PATH]{};
         const DWORD n = ::GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
-        const wchar_t* name = (n != 0 && n < ARRAYSIZE(path)) ? BaseName(path) : L"";
-        g_isTarget = SameI(name, L"regedit.exe")  || 
-                     SameI(name, L"regedt32.exe") ||
-//                   SameI(name, L"umbra-sample.exe") ||
-                     SameI(name, L"7zFM.exe") ||
-                     SameI(name, L"7zG.exe") ||
-                     SameI(name, L"spyxx_amd64.exe") ||
-                     SameI(name, L"explorer.exe") ||
-                     SameI(name, L"mmc.exe");
+        g_isTarget = (n != 0 && n < ARRAYSIZE(path)) && whitelist::IsWhitelisted(path);
+        return TRUE;
     }
 
     // Pin so we survive the host's UnhookWindowsHookEx: regedit keeps its theming (and our
@@ -383,6 +367,10 @@ namespace
 extern "C" __declspec(dllexport)
 LRESULT CALLBACK UmbraCbtHook(int code, WPARAM wParam, LPARAM lParam)
 {
+    // First CBT fire (any thread): decide whether this process is a whitelisted target. Reads the
+    // registry HERE, outside the loader lock (see EvalTargetOnce); a no-op once latched.
+    ::InitOnceExecuteOnce(&g_targetOnce, EvalTargetOnce, nullptr, nullptr);
+
     // First CBT fire on a thread is its first window's HCBT_CREATEWND (before WM_NCCREATE);
     // bootstrap process + thread there so that very window is caught by CallWndProc.
     if (g_isTarget && code >= 0 && !t_theming)
@@ -401,7 +389,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         g_self = module;
         ::DisableThreadLibraryCalls(module);
-        InitProcessFlags();
+        // NB: target evaluation is deferred to the first CBT fire (EvalTargetOnce) — it reads the
+        // registry, which is unsafe under the loader lock held here.
     }
     return TRUE;
 }

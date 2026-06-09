@@ -93,7 +93,10 @@
     <ClCompile Include="src\ThemeColorHook.cpp" />
     <!-- dui70 DirectUI::Element::PaintBackground hook (host resolves its RVA via symbols). -->
     <ClCompile Include="src\DuiPaintHook.cpp" />
+    <!-- Registry-backed target whitelist, shared with the host (replaces the hardcoded list). -->
+    <ClCompile Include="src\whitelist.cpp" />
     <ClInclude Include="src\hook.h" />
+    <ClInclude Include="src\whitelist.h" />
   </ItemGroup>
 
   <!-- Build + link the umbra static library from ../WM_UMBRA (source, not vcpkg). CRT model
