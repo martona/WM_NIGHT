@@ -4,6 +4,7 @@ name: Release pipeline (reusable)
 # Invoked from release-tag.yml and release-manual.yml; not directly triggerable. Callers
 # parse the version from src/version.h (the single version control point) and pass
 # version/tag/draft in. Windows only (amd64 + arm64).
+#
 
 on:
   workflow_call:

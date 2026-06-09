@@ -4,6 +4,7 @@ name: Release (tag)
 # version control point): the resolve job parses version.h, asserts the tag agrees, and also
 # checks WMN_VERSION_STR is in sync with the four numeric macros. Always drafts; publish via
 # `gh release edit --draft=false <tag>` or the UI's Publish button.
+#
 
 on:
   push:

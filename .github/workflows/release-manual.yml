@@ -3,6 +3,7 @@ name: Release (manual)
 # Operator-triggered release. The version comes from src/version.h (the single version
 # control point) — there is no version input to drift out of sync. Defaults to a draft; tick
 # `publish` to release immediately. Delegates the heavy lifting to _release.yml.
+#
 
 on:
   workflow_dispatch:
