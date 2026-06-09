@@ -398,7 +398,7 @@ namespace
         }
 
         TextBlock title;
-        title.Text(L"Settings");
+        title.Text(L"WM_NIGHT");
         title.FontSize(28);
         title.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
         title.Margin(ThicknessHelper::FromLengths(24, 24, 24, 12));
@@ -452,6 +452,20 @@ namespace
     {
         switch (msg)
         {
+        case WM_ERASEBKGND:
+        {
+            // Fill the client with the themed colour BEFORE the XAML island first paints, so a
+            // dark-mode launch doesn't flash white.
+            const HDC hdc = reinterpret_cast<HDC>(wParam);
+            RECT rc{};
+            ::GetClientRect(hwnd, &rc);
+            const HBRUSH br = ::CreateSolidBrush(umbra::isDarkModeReg() ? RGB(32, 32, 32)
+                                                                        : RGB(243, 243, 243));
+            ::FillRect(hdc, &rc, br);
+            ::DeleteObject(br);
+            return 1;
+        }
+
         case WM_SIZE:
             SizeIslandToClient();
             return 0;

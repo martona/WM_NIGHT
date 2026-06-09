@@ -103,6 +103,7 @@
   <ItemGroup>
     <ClCompile Include="src\WM_NIGHT.cpp" />
     <ClCompile Include="src\SettingsWindow.cpp" />
+    <ClCompile Include="src\AboutDialog.cpp" />
     <ClCompile Include="src\whitelist.cpp" />
   </ItemGroup>
 
@@ -114,6 +115,7 @@
     <ClInclude Include="src\resource.h" />
     <ClInclude Include="src\version.h" />
     <ClInclude Include="src\SettingsWindow.h" />
+    <ClInclude Include="src\AboutDialog.h" />
     <ClInclude Include="src\whitelist.h" />
   </ItemGroup>
 

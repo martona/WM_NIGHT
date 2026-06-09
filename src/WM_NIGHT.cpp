@@ -34,11 +34,13 @@
 #include "resource.h"
 #include "version.h"
 #include "SettingsWindow.h"   // XAML-Islands Settings window
+#include "AboutDialog.h"      // About box (Win32 dialog)
 
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "advapi32.lib")   // registry: autostart + single-instance
 
 namespace
 {
@@ -72,6 +74,33 @@ namespace
         std::wstring p(path, (n != 0 && n < ARRAYSIZE(path)) ? n : 0);
         const size_t slash = p.find_last_of(L"\\/");
         return slash == std::wstring::npos ? L"." : p.substr(0, slash);
+    }
+
+    // Register / unregister logon autostart (HKCU Run). The command carries /tray so the launched
+    // instance stays quietly in the tray (no Settings pop). Best-effort.
+    void SetAutostart(bool enable)
+    {
+        HKEY key = nullptr;
+        if (::RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                            0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+            return;
+        if (enable)
+        {
+            wchar_t path[MAX_PATH]{};
+            const DWORD n = ::GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+            if (n != 0 && n < ARRAYSIZE(path))
+            {
+                const std::wstring cmd = L"\"" + std::wstring(path) + L"\" /tray";
+                ::RegSetValueExW(key, L"WM_NIGHT", 0, REG_SZ,
+                    reinterpret_cast<const BYTE*>(cmd.c_str()),
+                    static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
+            }
+        }
+        else
+        {
+            ::RegDeleteValueW(key, L"WM_NIGHT");
+        }
+        ::RegCloseKey(key);
     }
 
     // --- dui70 Element::PaintBackground RVA resolution (host-side) -----------
@@ -364,13 +393,10 @@ namespace
                 ShowSettingsWindow(g_hInst);
                 return 0;
             case IDM_ABOUT:
-                umbra::DarkMessageBox(hWnd,
-                    WMN_PRODUCT_NAME L"  " WMN_VERSION_STR L"\n"
-                    L"Native dark mode for the Windows desktop.\n\n"
-                    WMN_COPYRIGHT,
-                    L"About " WMN_PRODUCT_NAME, MB_OK | MB_ICONINFORMATION);
+                ShowAboutDialog(hWnd);
                 return 0;
             case IDM_EXIT:
+                SetAutostart(false);   // manual exit: stop auto-running, then tear down
                 ::DestroyWindow(hWnd);
                 return 0;
             }
@@ -385,18 +411,37 @@ namespace
     }
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
 {
+    // Safety hatch: holding Shift while we start (e.g. at logon) makes us exit silently BEFORE
+    // installing the global hook — a way out if a crash/conflict would otherwise hose explorer.
+    if ((::GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0)
+        return 0;
+
     g_hInst = hInstance;
     ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // Single instance: a second host would install a second global WH_CBT hook and double-inject
-    // the payload. The handle is intentionally kept for the process lifetime (freed on exit).
+    // Autostart launches us with /tray (stay quietly in the tray); a manual launch (no /tray) also
+    // opens the Settings window once we are up.
+    const bool trayMode = (lpCmdLine != nullptr && ::wcsstr(lpCmdLine, L"/tray") != nullptr);
+
+    // Single instance: a second host would install a second global WH_CBT hook and double-inject.
+    // A manual relaunch surfaces the running instance's Settings; an autostart relaunch just exits.
+    // The handle is intentionally kept for the process lifetime (freed on exit).
     ::CreateMutexW(nullptr, FALSE, L"Local\\WM_NIGHT_singleton");
     if (::GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        if (!trayMode)
+            if (const HWND existing = ::FindWindowW(kWndClassName, nullptr))
+                ::PostMessageW(existing, WM_COMMAND, IDM_SETTINGS, 0);
         return 0;
+    }
 
-    const INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES };
+    // Auto-run at logon. Only a manual Exit unregisters this; any other exit (Shift hatch, crash,
+    // reboot) leaves it so we come back next logon.
+    SetAutostart(true);
+
+    const INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_LINK_CLASS };
     ::InitCommonControlsEx(&icc);
     umbra::initDarkMode();   // app-wide dark opt-in (also darkens our popup menu + message boxes)
     SettingsInit();          // COM apartment (STA) for the XAML-Islands Settings window
@@ -453,6 +498,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int)
         ::FreeLibrary(g_hookModule);
         return 1;
     }
+
+    // A manual launch (no /tray) opens Settings immediately; autostart stays quiet in the tray.
+    if (!trayMode)
+        ShowSettingsWindow(g_hInst);
 
     MSG msg{};
     while (::GetMessageW(&msg, nullptr, 0, 0) > 0)
