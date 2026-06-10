@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // DuiPaintHook.cpp — process-wide dui70 DirectUI::Element::PaintBackground hook.
-//   (WM_NIGHThook payload — the DUI-element interception lever.)
+//   (WM_NIGHThook — the DUI-element lever.)
 //
 // The Control Panel header/sidebar (and other DirectUI element backgrounds) are filled inside
 // DirectUI::Element::PaintBackground, which runs BEFORE the offscreen memory-DC composite. Our
@@ -43,13 +43,13 @@
 #  define DUI_CC __stdcall
 #endif
 
-// --- host->payload handoff: a PE SHARED section (no file, no named object) ------------------
+// --- host->dll handoff: a PE SHARED section (no file, no named object) ------------------------
 // This is a global-hook DLL: it has a SEPARATE image — and separate ordinary globals — in every
 // process it maps into, so an exported setter called in the HOST would set only the host's copy;
 // the explorer-injected copy would never see it. Variables in a shared section are backed by the
 // SAME physical pages in every process that maps this image, so the host's one write is visible
 // to all injected copies. The host resolves dui70's Element::PaintBackground RVA and calls
-// UmbraSetDuiPaintBg() once, BEFORE installing the global hook; every payload copy reads it here.
+// UmbraSetDuiPaintBg() once, BEFORE installing the global hook; every dll copy reads it here.
 #pragma section("umbrashr", read, write, shared)
 __declspec(allocate("umbrashr")) volatile LONG g_sharedDuiRva   = 0;   // 0 = host has not set it
 __declspec(allocate("umbrashr")) volatile LONG g_sharedDuiStamp = 0;   // dui70 TimeDateStamp
@@ -197,6 +197,9 @@ namespace
         // Filling is idempotent (an already-dark background just stays dark), so it is correct on
         // every repaint, breadcrumb-back included. The (raw+20)&7 "code" is a masked-away relabel
         // and partly a pointer-alignment artifact; kept for the log only, never for the decision.
+        //
+        //  Null=0  Int=1  Bool=2  Element=3  Ellist=4  String=5  Point=6  Size=7
+        //  Rect=8  Color=9  Layout=10  Graphic=11  Sheet=12  Expr=13  ...
         int code = -1, type = -1;
         if (value != nullptr)
         {
