@@ -355,8 +355,6 @@ namespace
     // in this process. Unlike GetSysColor/uxtheme (loaded early), dui70 loads LAZILY (only when
     // the shell shows DUI — Control Panel, the navigation pane, ...), so a one-shot at init
     // would miss it. We retry on each window-creation CBT fire until it attaches, then latch.
-    // A permanent failure (no host RVA / stamp mismatch) makes setProcessWideDuiPaintHook a
-    // cheap flag-check no-op, so retrying costs nothing.
     void EnsureDuiPaintHook() noexcept
     {
         static volatile LONG s_done = 0;

@@ -10,11 +10,11 @@
 // HWND to target — the theme-draw log tags these wnd=memDC). This hook sits one layer up: it
 // recolours the fill at its source, so the double-buffering is irrelevant.
 //
-// The member is non-exported, so the HOST (WM_NIGHT.exe) resolves its RVA via symbols and
+// The member is non-exported, so the HOST (WM_NIGHT.exe) resolves its offset via symbols and
 // hands it to us through the exported UmbraSetDuiPaintBg() (see the shared-section note below).
-// We confirm the live dui70 matches (PE TimeDateStamp + SizeOfImage — a wrong RVA would crash
-// on attach), add the RVA to the loaded base, and Detour-attach. No-ops if the host gave us no
-// RVA or dui70 is not mapped in this process.
+// We confirm the live dui70 matches (PE TimeDateStamp + SizeOfImage — a wrong offset would crash
+// on attach), add the offset to the loaded base, and Detour-attach. No-ops if the host gave us no
+// offset or dui70 is not mapped in this process.
 //
 // SPIKE / TEMP: LOGS every element paint (seq + decision) to dui-paint.log, and fills every
 // non-overlay DUI background (Value TYPE tag != 1) with umbra's palette. The type tag is the real
@@ -48,8 +48,7 @@
 // process it maps into, so an exported setter called in the HOST would set only the host's copy;
 // the explorer-loaded copy would never see it. Variables in a shared section are backed by the
 // SAME physical pages in every process that maps this image, so the host's one write is visible
-// to all loaded copies. The host resolves dui70's Element::PaintBackground RVA and calls
-// UmbraSetDuiPaintBg() once, BEFORE installing the global hook; every dll copy reads it here.
+// to all loaded copies. 
 #pragma section("umbrashr", read, write, shared)
 __declspec(allocate("umbrashr")) volatile LONG g_sharedDuiRva   = 0;   // 0 = host has not set it
 __declspec(allocate("umbrashr")) volatile LONG g_sharedDuiStamp = 0;   // dui70 TimeDateStamp
@@ -66,7 +65,7 @@ namespace
 
     fnElementPaintBg g_realElementPaintBg = nullptr;
     bool             g_installed = false;
-    bool             g_giveUp    = false;   // permanent failure (no RVA / stamp mismatch)
+    bool             g_giveUp    = false;   // permanent failure (stamp mismatch, etc)
 
     // ---- recolour brush (umbra palette) ------------------------------------
     std::mutex g_brushMutex;
@@ -183,6 +182,7 @@ namespace
     }
 
     // ---- the hook ----------------------------------------------------------
+    // DirectUI::Element::PaintBackground
     void DUI_CC HookElementPaintBg(void* This, HDC hdc, void* value,
                                    RECT* pRect, RECT* pClip, RECT* pExclude, RECT* pTarget)
     {
@@ -192,8 +192,8 @@ namespace
         // A 15k-paint Control Panel log showed exactly three types, splitting cleanly:
         //   type 9  = content / nav backgrounds  (the centre block the mod's `type!=9` SKIPPED)
         //   type 11 = header / sidebar chrome
-        //   type 1  = root + hover/hot overlays  (interactive highlights live here)
-        // So fill the backgrounds (type != 1) and LEAVE type 1 — that preserves hover/selection.
+        //   type 1  = root
+        // So fill the backgrounds (type != 1) and LEAVE type 1.
         // Filling is idempotent (an already-dark background just stays dark), so it is correct on
         // every repaint, breadcrumb-back included. The (raw+20)&7 "code" is a masked-away relabel
         // and partly a pointer-alignment artifact; kept for the log only, never for the decision.
@@ -208,7 +208,7 @@ namespace
             const unsigned __int64 raw = *(reinterpret_cast<const unsigned __int64*>(value) + 1);
             code = static_cast<int>((raw + 20) & 7);
         }
-
+                                                                                           //code == 2 is highlights
         if (value != nullptr && type != 1 && pRect != nullptr && code != 3 && code != 6 && !(code == 2 && type == 9))
         {
             ::FillRect(hdc, pRect, code == 4 ? CtrlBackBrush() : DlgBackBrush() );   // background -> dark; skip the original
@@ -221,9 +221,7 @@ namespace
     }
 }
 
-// Exported: the host calls this ONCE (before installing the global hook) with the RVA it resolved
-// via symbols plus dui70's PE identity. Writes the shared section so every loaded copy sees it.
-// rva is written LAST — it is the "ready" latch the DLL reads first.
+// Exported: the host calls this ONCE (before installing the global hook) 
 extern "C" __declspec(dllexport)
 void UmbraSetDuiPaintBg(unsigned long rva, unsigned long stamp, unsigned long size) noexcept
 {
