@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// WM_NIGHT.exe — GUI (tray-resident) host / controller for the WM_NIGHThook payload.
+// WM_NIGHT.exe — GUI (tray-resident) host / controller for the WM_NIGHThook DLL.
 //
 // Installs ONE global WH_CBT hook whose proc lives in WM_NIGHThook.dll, then lives in the
-// notification area pumping messages so the hook stays live. WH_CBT maps the payload into
-// each target process as early as its first window; the payload whitelists its targets and
+// notification area pumping messages so the hook stays live. WH_CBT maps the DLL into
+// each target process as early as its first window; the DLL whitelists its targets and
 // themes from there. uiAccess (asInvoker + signed, see WM_NIGHT.vcxproj) lets this
 // medium-integrity host reach an elevated regedit without elevating itself.
 
@@ -128,15 +128,15 @@ namespace
     }
 
     // --- dui70 Element::PaintBackground RVA resolution (host-side) -----------
-    // The payload wants to hook DirectUI::Element::PaintBackground in injected shell processes.
+    // The DLL wants to hook DirectUI::Element::PaintBackground in loaded shell processes.
     // Turns out the member is EXPORTED by dui70.dll, so we resolve its RVA once HERE off the export
     // table (no .pdb / symbol server / network needed — see ResolveDuiPaintBgRva) and hand the
-    // payload only an RVA + the dui70 PE identity, through the DLL's exported UmbraSetDuiPaintBg()
-    // (a shared section forwards it to every injected copy). The payload adds the RVA to the live
+    // DLL only an RVA + the dui70 PE identity, through the DLL's exported UmbraSetDuiPaintBg()
+    // (a shared section forwards it to every loaded copy). The DLL adds the RVA to the live
     // dui70 base (validating the identity first). Assumes a matching arch: build the host x64 to
     // theme x64 shells (this box's case).
 
-    // dui70's TimeDateStamp + SizeOfImage off disk — the payload confirms its loaded copy matches
+    // dui70's TimeDateStamp + SizeOfImage off disk — the DLL confirms its loaded copy matches
     // before trusting the RVA (a wrong RVA would crash on attach).
     bool ReadPeIdentityFromDisk(const wchar_t* path, DWORD& stamp, DWORD& sizeOfImage)
     {
@@ -182,7 +182,7 @@ namespace
 
     // %LocalLow%\WM_NIGHT — our per-user data dir. Under MSIX, filesystem write-virtualization is
     // disabled (see the AppxManifest), so writes here hit the REAL path — which OUT-of-package
-    // targets (explorer/regedit) can read. That is what makes the staged payload DLL reachable.
+    // targets (explorer/regedit) can read. That is what makes the staged DLL reachable.
     std::wstring LocalLowAppDir()
     {
         // FOLDERID_LocalLow = {A520A1A4-1780-4FF6-BD18-167343C5AF16}, spelled out so we don't
@@ -197,8 +197,8 @@ namespace
         return dir;
     }
 
-    // --- Payload staging (MSIX) ----------------------------------------------
-    // A packaged host's WM_NIGHThook.dll lives in WindowsApps, which the injected targets cannot
+    // --- DLL staging (MSIX) ----------------------------------------------
+    // A packaged host's WM_NIGHThook.dll lives in WindowsApps, which the loaded targets cannot
     // read — so a global hook installed from it never lands. We copy it to real %LocalLow% (which
     // those targets CAN read) and hook from there. The copy takes a RANDOM name because a hook DLL
     // stays mapped — and the file stays locked — in any target still running from a prior session;
@@ -226,9 +226,9 @@ namespace
         ::FindClose(h);
     }
 
-    // Copy the in-package payload to %LocalLow%\WM_NIGHT\WM_NIGHThook.<rand>.dll; returns that path,
+    // Copy the in-package DLL to %LocalLow%\WM_NIGHT\WM_NIGHThook.<rand>.dll; returns that path,
     // or empty on failure (the caller then falls back to the in-package DLL).
-    std::wstring StagePayloadDll(const std::wstring& source)
+    std::wstring StageDll(const std::wstring& source)
     {
         const std::wstring dir = LocalLowAppDir();
         if (dir.empty())
@@ -251,14 +251,14 @@ namespace
         return dest;
     }
 
-    // Where to LoadLibrary the payload from. Loose build: next to the exe (already target-readable).
+    // Where to LoadLibrary the DLL from. Loose build: next to the exe (already target-readable).
     // Packaged build: a staged copy in %LocalLow% (the WindowsApps copy isn't target-readable).
-    std::wstring ResolvePayloadDllPath()
+    std::wstring ResolveDllPath()
     {
         const std::wstring inPackage = ModuleDir() + L"\\WM_NIGHThook.dll";
         if (!IsPackaged())
             return inPackage;
-        const std::wstring staged = StagePayloadDll(inPackage);
+        const std::wstring staged = StageDll(inPackage);
         return staged.empty() ? inPackage : staged;
     }
 
@@ -335,12 +335,12 @@ namespace
                               RRF_RT_REG_DWORD, nullptr, &val, &sz) == ERROR_SUCCESS && val == 1;
     }
 
-    // Resolve the dui70 RVA and hand it to the payload via UmbraSetDuiPaintBg (a shared section
-    // forwards it to every injected copy). Synchronous and instant — it's an export-table lookup, no
-    // network. Best-effort: on failure the payload simply runs without the DUI paint hook.
+    // Resolve the dui70 RVA and hand it to the DLL via UmbraSetDuiPaintBg (a shared section
+    // forwards it to every loaded copy). Synchronous and instant — it's an export-table lookup, no
+    // network. Best-effort: on failure the DLL simply runs without the DUI paint hook.
     //
     // Gated: when EnableDuiHook is off (the default) we never hand over an RVA, so the shared
-    // section stays 0 and no injected copy attaches the hook (setProcessWideDuiPaintHook no-ops).
+    // section stays 0 and no loaded copy attaches the hook (setProcessWideDuiPaintHook no-ops).
     void HandOffDuiPaintBg()
     {
         g_diagDuiEnabled = IsDuiHookEnabled();
@@ -362,10 +362,10 @@ namespace
             g_diagDuiOk  = true;
         }
         else
-            Dbg(L"[dui] unresolved; payload runs WITHOUT the DUI paint hook.\n");
+            Dbg(L"[dui] unresolved; DLL runs WITHOUT the DUI paint hook.\n");
     }
 
-    // Terminate explorer.exe so the still-pinned payload is dropped from the shell and the next
+    // Terminate explorer.exe so the still-pinned DLL is dropped from the shell and the next
     // run starts clean — the automated form of the manual "restart Explorer" between test cycles.
     // Windows' AutoRestartShell (on by default) brings a fresh shell straight back; we run at the
     // same user + integrity as explorer, so we are permitted to terminate it. Open File Explorer
@@ -549,7 +549,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     // opens the Settings window once we are up.
     const bool trayMode = (lpCmdLine != nullptr && ::wcsstr(lpCmdLine, L"/tray") != nullptr);
 
-    // Single instance: a second host would install a second global WH_CBT hook and double-inject.
+    // Single instance: a second host would install a second global WH_CBT hook and double-load.
     // A manual relaunch surfaces the running instance's Settings; an autostart relaunch just exits.
     // The handle is intentionally kept for the process lifetime (freed on exit).
     ::CreateMutexW(nullptr, FALSE, L"Local\\WM_NIGHT_singleton");
@@ -592,9 +592,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
     if (g_hWnd == nullptr)
         return 1;
 
-    // Load the payload (the global hook injects THIS copy into each target). Packaged builds stage
+    // Load the DLL (the global hook loads THIS copy into each target). Packaged builds stage
     // it to %LocalLow% first, since the in-package WindowsApps copy isn't readable by the targets.
-    const std::wstring dllPath = ResolvePayloadDllPath();
+    const std::wstring dllPath = ResolveDllPath();
     g_hookModule = ::LoadLibraryW(dllPath.c_str());
     if (g_hookModule == nullptr)
     {
@@ -612,7 +612,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
         return 1;
     }
 
-    // Resolve dui70's Element::PaintBackground and hand it to the payload before the hook goes in.
+    // Resolve dui70's Element::PaintBackground and hand it to the DLL before the hook goes in.
     HandOffDuiPaintBg();   // resolve the dui70 RVA (export-table lookup: instant, offline) and hand it off
 
     g_cbtHook = ::SetWindowsHookExW(WH_CBT, cbtProc, g_hookModule, 0);
@@ -639,9 +639,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
         ::DispatchMessageW(&msg);
     }
 
-    // Teardown (Exit / WM_QUIT). Mirrors the old console path: unhook, release our payload
+    // Teardown (Exit / WM_QUIT). Mirrors the old console path: unhook, release our DLL
     // reference, then bounce explorer so the copy still pinned in the shell is dropped and the
-    // next launch injects a fresh payload into a clean tree.
+    // next launch loads a fresh DLL into a clean tree.
     ::UnhookWindowsHookEx(g_cbtHook);
     ::FreeLibrary(g_hookModule);
     if (g_trayIcon != nullptr)

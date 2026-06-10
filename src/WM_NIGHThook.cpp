@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// WM_NIGHThook.dll — injected dark-theming payload (WM_NIGHT harness).
+// WM_NIGHThook.dll — dark-theming DLL (WM_NIGHT harness).
 //
 // WM_NIGHT.exe installs ONE global WH_CBT hook whose proc lives here, so this DLL
 // maps into target processes as early as their first window — before WM_NCCREATE.
@@ -386,7 +386,7 @@ LRESULT CALLBACK UmbraCbtHook(int code, WPARAM wParam, LPARAM lParam)
     return ::CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
-// Build version of this payload, packed as (major<<24)|(minor<<16)|(patch<<8)|revision, so the
+// Build version of this DLL, packed as (major<<24)|(minor<<16)|(patch<<8)|revision, so the
 // host can confirm it loaded the MATCHING DLL and surface it in the Settings diagnostics.
 // extern "C" -> undecorated export name on x64.
 extern "C" __declspec(dllexport) unsigned long UmbraHookVersion() noexcept

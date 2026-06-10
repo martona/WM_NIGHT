@@ -1,9 +1,9 @@
-# unstick-payload.ps1 — pre-build helper for WM_NIGHThook.vcxproj.
+# unstick-dll.ps1 — pre-build helper for WM_NIGHThook.vcxproj.
 #
 # A global WH_CBT hook DLL lingers, still mapped, in every process it touched until
 # that process pumps a message after we unhook — which locks the file so the linker
 # can't overwrite it on the next build (LNK1168). A mapped image CAN still be renamed,
-# so: if the current payload DLL is locked, move it aside to .dll.<6 digits> so a
+# so: if the current DLL is locked, move it aside to .dll.<6 digits> so a
 # fresh one links; then sweep aside-copies that have since been released. Run only when
 # the DLL is actually locked, so an up-to-date incremental build keeps its output (and a
 # locked-but-stale build self-heals: the now-missing output forces a relink).

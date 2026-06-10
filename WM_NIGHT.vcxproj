@@ -43,7 +43,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
 
   <!-- umbra (the dark-mode static lib) now comes from the WM_UMBRA vcpkg git registry, the same
-       way the payload gets Detours — see vcpkg.json / vcpkg-configuration.json. The host links
+       way the DLL gets Detours — see vcpkg.json / vcpkg-configuration.json. The host links
        umbra so its OWN UI (tray popup menu, message boxes) follows dark mode; it still needs
        dbghelp for the one-time dui70 symbol resolution. -->
   <PropertyGroup Label="Vcpkg">
@@ -122,7 +122,7 @@
     <ClInclude Include="src\whitelist.h" />
   </ItemGroup>
 
-  <!-- Build the payload first (ordering only; the host LoadLibrary's it at runtime, so
+  <!-- Build the DLL first (ordering only; the host LoadLibrary's it at runtime, so
        no link dependency) — and so the sign step below sees both artifacts. -->
   <ItemGroup>
     <ProjectReference Include="WM_NIGHThook.vcxproj">
@@ -133,7 +133,7 @@
   </ItemGroup>
 
   <!-- Code signing (Azure Trusted Signing via the `sign` dotnet tool). uiAccess is honored
-       only for a signed binary, so sign both the host and the payload. No-ops on boxes
+       only for a signed binary, so sign both the host and the DLL. No-ops on boxes
        without the ARTIFACT_SIGNING_* env. -->
   <Target Name="SignArtifacts" AfterTargets="Build" Condition="'$(ARTIFACT_SIGNING_ENDPOINT)'!=''">
     <Message Importance="high" Text="Signing WM_NIGHT.exe + WM_NIGHThook.dll (Trusted Signing)..." />

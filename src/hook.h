@@ -2,22 +2,20 @@
 #include <windows.h>
 #include <strsafe.h>
 
-// Shared across the WM_NIGHT injection harness (host umbra-inject + payload umbra-payload).
-
-// Master switch for ALL diagnostic file logging (dui-paint, themecolor, umbra-inject). Set to 0
-// here (or define it from the build) to compile every diagnostic log out across host and payload.
+// Master switch for ALL diagnostic file logging (dui-paint, themecolor. Set to 0
+// here (or define it from the build) to compile every diagnostic log out across host and DLL.
 // TEMP scaffolding — the logs never ship.
 #ifndef UMBRA_DIAG
 #  define UMBRA_DIAG 0
 #endif
 
 // --- Diagnostic logs: one fixed location, one file per target -------------
-// Every host/payload diagnostic log goes to ONE hardcoded directory, so they never scatter across
-// module dirs. (An injected target's <module dir> resolves to C:\Windows / system32, which a
+// Every host/DLL diagnostic log goes to ONE hardcoded directory, so they never scatter across
+// module dirs. (A loaded target's <module dir> resolves to C:\Windows / system32, which a
 // medium-integrity process can't even write — so logs would silently vanish.) A fixed repo path
 // under the user profile is writable by both elevated and medium-integrity targets. The running
 // .exe's name is appended to each log's base, so the global hook's several targets write SEPARATE
-// files — themecolor-regedit.log, umbra-inject-explorer.log — instead of clobbering one shared
+// files — themecolor-regedit.log, etc. — instead of clobbering one shared
 // file. Hardcoded by design: throwaway diagnostic plumbing that never ships. Delete for a clean run.
 inline constexpr const wchar_t* kUmbraLogDir =
     L"C:\\Users\\Marton\\Desktop\\github\\WM_NIGHT\\logs";
@@ -78,10 +76,10 @@ inline bool umbraLogPath(const wchar_t* fileName, wchar_t* out, size_t outCount)
                                         kUmbraLogDir, base, exe, ext));
 }
 
-// --- Process-wide dark hooks (compiled into the payload) -------------------
+// --- Process-wide dark hooks (compiled into the DLL) -------------------
 // The interception half of UMBRA's dark mode: Detours-based, process-wide hooks that drive the
 // umbra library's per-window / per-colour theming decisions. The Detours dependency lives here in
-// the payload, never in the umbra library.
+// the DLL, never in the umbra library.
 
 // GetSysColor / GetSysColorBrush inline hook (classic + DirectUI colour residue).
 bool setProcessWideColorHook() noexcept;
@@ -95,9 +93,9 @@ void unsetProcessWideThemeColorHook() noexcept;
 // dui70 DirectUI::Element::PaintBackground inline hook (Detours). DUI element backgrounds (the
 // Control Panel content/chrome, ...) are filled HERE — before the offscreen memory-DC composite —
 // so this reaches surfaces uxtheme hooks miss and window-level erase/backfill can't hold. The
-// member is NON-exported: the host (umbra-inject.exe) resolves its RVA via symbols and passes it
-// in through the DLL's exported UmbraSetDuiPaintBg() (a shared section carries it to every injected
-// copy); the payload adds the live dui70 base and attaches. Returns true once attached; a cheap
+// member is NON-exported: the host resolves its RVA via symbols and passes it
+// in through the DLL's exported UmbraSetDuiPaintBg() (a shared section carries it to every loaded
+// copy); the DLL adds the live dui70 base and attaches. Returns true once attached; a cheap
 // no-op if the host gave no RVA / it mismatched, and a transient false (retry on a later window-
 // creation) while dui70 is not yet loaded in this process. TEMP.
 bool setProcessWideDuiPaintHook() noexcept;

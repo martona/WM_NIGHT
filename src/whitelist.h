@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
-// Shared whitelist config for the WM_NIGHT harness. Compiled into BOTH the payload
-// (WM_NIGHThook.dll — calls IsWhitelisted on the process it injected into) and the host /
+// Shared whitelist config for the WM_NIGHT harness. Compiled into BOTH the DLL
+// (WM_NIGHThook.dll — calls IsWhitelisted on the process it loads into) and the host /
 // settings UI (WM_NIGHT.exe — reads and edits the list). Pure Win32: no umbra, no XAML, so the
-// payload stays lean.
+// DLL stays lean.
 //
 // Storage: HKCU\Software\WM_NIGHT\Targets, one REG_SZ value per target. The value NAME is the
 // target's full path (may contain %SystemRoot% etc.); the value data is reserved for future
@@ -20,7 +20,7 @@ namespace whitelist
 {
     // Is `fullProcessPath` (a real, expanded path, e.g. from GetModuleFileNameW) on the
     // whitelist? Reads the registry on each call via a stack-only path (no allocations). Used by
-    // the payload once per process, on first injection.
+    // the DLL once per process, on first load.
     [[nodiscard]] bool IsWhitelisted(const wchar_t* fullProcessPath) noexcept;
 
     // True if the user has ever configured the list (i.e. the subkey exists).

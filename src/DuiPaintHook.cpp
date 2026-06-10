@@ -46,9 +46,9 @@
 // --- host->dll handoff: a PE SHARED section (no file, no named object) ------------------------
 // This is a global-hook DLL: it has a SEPARATE image — and separate ordinary globals — in every
 // process it maps into, so an exported setter called in the HOST would set only the host's copy;
-// the explorer-injected copy would never see it. Variables in a shared section are backed by the
+// the explorer-loaded copy would never see it. Variables in a shared section are backed by the
 // SAME physical pages in every process that maps this image, so the host's one write is visible
-// to all injected copies. The host resolves dui70's Element::PaintBackground RVA and calls
+// to all loaded copies. The host resolves dui70's Element::PaintBackground RVA and calls
 // UmbraSetDuiPaintBg() once, BEFORE installing the global hook; every dll copy reads it here.
 #pragma section("umbrashr", read, write, shared)
 __declspec(allocate("umbrashr")) volatile LONG g_sharedDuiRva   = 0;   // 0 = host has not set it
@@ -222,8 +222,8 @@ namespace
 }
 
 // Exported: the host calls this ONCE (before installing the global hook) with the RVA it resolved
-// via symbols plus dui70's PE identity. Writes the shared section so every injected copy sees it.
-// rva is written LAST — it is the "ready" latch the payload reads first.
+// via symbols plus dui70's PE identity. Writes the shared section so every loaded copy sees it.
+// rva is written LAST — it is the "ready" latch the DLL reads first.
 extern "C" __declspec(dllexport)
 void UmbraSetDuiPaintBg(unsigned long rva, unsigned long stamp, unsigned long size) noexcept
 {
