@@ -72,3 +72,5 @@ Alternatively, run **Release (manual)** from the Actions tab (it reads `version.
 ## Contributing
 
 Issues and PRs welcome.
+
+This is a personal, non-commercial project. Copyright (C) 2026 [Marton Anka](https://anka.me)
