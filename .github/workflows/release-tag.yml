@@ -5,6 +5,10 @@ name: Release (tag)
 # checks WMN_VERSION_STR is in sync with the four numeric macros. Always drafts; publish via
 # `gh release edit --draft=false <tag>` or the UI's Publish button.
 #
+# No-ops when a release already exists for the tag: publishing a draft (e.g. one the
+# manual workflow built) creates the tag, which re-fires this push-triggered workflow;
+# the guard skips that duplicate build. A fresh tag push has no release yet, so it
+# builds normally -- so either flow works.
 
 on:
   push:
@@ -27,6 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.compute.outputs.version }}
       tag: ${{ steps.compute.outputs.tag }}
+      exists: ${{ steps.check.outputs.exists }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -58,9 +63,27 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Resolved: version=$hver tag=$tag"
 
+      - id: check
+        # A release already existing for this tag means the tag was just created by
+        # publishing a draft (which the manual workflow already built) -- skip the
+        # duplicate build. `gh release view` exits non-zero when no release exists, so a
+        # fresh tag push proceeds; the if/else keeps the step green either way.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.compute.outputs.tag }}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $tag already exists -- skipping duplicate build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   pipeline:
     name: Build, sign, publish
     needs: resolve
+    if: needs.resolve.outputs.exists != 'true'
     uses: ./.github/workflows/_release.yml
     with:
       version: ${{ needs.resolve.outputs.version }}
