@@ -639,6 +639,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
         ::DispatchMessageW(&msg);
     }
 
+    // Tear down XAML Islands first, while this thread can still pump — leaving the XamlManager /
+    // DispatcherQueue to CRT static destructors crashes the process on exit with a stowed
+    // exception (0xC000027B), which winget validation reads as a failed run.
+    SettingsShutdown();
+
     // Teardown (Exit / WM_QUIT). Mirrors the old console path: unhook, release our DLL
     // reference, then bounce explorer so the copy still pinned in the shell is dropped and the
     // next launch loads a fresh DLL into a clean tree.

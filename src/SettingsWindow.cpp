@@ -136,7 +136,7 @@ namespace
     }
 
     // XAML Islands needs a DispatcherQueue on this thread and the XAML framework initialized for
-    // it. Done once (the manager + dispatcher controller are kept alive for the process lifetime).
+    // it. Done once; both are torn down explicitly by SettingsShutdown() before wWinMain returns.
     void EnsureXamlBootstrapped()
     {
         if (g_manager)
@@ -243,12 +243,18 @@ namespace
     // Extract the icon (sync, GDI) then push it into the Image asynchronously (SetBitmapAsync).
     fire_and_forget SetExeIcon(Image image, std::wstring path)
     {
-        auto sb = MakeIconBitmap(path);
-        if (!sb)
-            co_return;
-        wxi::SoftwareBitmapSource src;
-        co_await src.SetBitmapAsync(sb);
-        image.Source(src);
+        // An exception escaping a fire_and_forget fail-fasts the whole process with a stowed
+        // exception (0xC000027B) — a missing icon is not worth dying for.
+        try
+        {
+            auto sb = MakeIconBitmap(path);
+            if (!sb)
+                co_return;
+            wxi::SoftwareBitmapSource src;
+            co_await src.SetBitmapAsync(sb);
+            image.Source(src);
+        }
+        catch (...) {}
     }
 
     std::wstring PickExe(HWND owner)
@@ -614,4 +620,42 @@ bool SettingsPreTranslateMessage(MSG* msg)
         return false;
     BOOL handled = FALSE;
     return SUCCEEDED(g_sourceNative2->PreTranslateMessage(msg, &handled)) && handled != FALSE;
+}
+
+void SettingsShutdown()
+{
+    // A Settings window still open at exit (Exit picked from the tray while it shows): destroy it
+    // now, while XAML is fully alive — WM_DESTROY closes the island source and nulls the content.
+    if (g_hwnd != nullptr)
+        ::DestroyWindow(g_hwnd);
+
+    // Close the XAML framework for this thread. Its teardown continues asynchronously on the
+    // DispatcherQueue, which is why the queue must be drained below rather than just released.
+    if (g_manager)
+    {
+        g_manager.Close();
+        g_manager = nullptr;
+    }
+
+    if (g_dq)
+    {
+        // Shut the queue down and keep dispatching until it reports completion (XAML's deferred
+        // teardown runs here). Hard 5s deadline: a wedged teardown must not hang process exit.
+        auto op = g_dq.ShutdownQueueAsync();
+        const ULONGLONG deadline = ::GetTickCount64() + 5000;
+        while (op.Status() == Windows::Foundation::AsyncStatus::Started
+               && ::GetTickCount64() < deadline)
+        {
+            MSG msg{};
+            while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                ::TranslateMessage(&msg);
+                ::DispatchMessageW(&msg);
+            }
+            if (op.Status() != Windows::Foundation::AsyncStatus::Started)
+                break;
+            ::MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        g_dq = nullptr;
+    }
 }
