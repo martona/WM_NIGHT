@@ -39,6 +39,13 @@ public static class Smoke
     [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "FindWindowW")]
     public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
 
+    // PowerShell converts $null to "" when binding to a string parameter, and
+    // FindWindowW(cls, "") only matches windows with an EMPTY title. Pass the null here.
+    public static IntPtr FindWindowByClass(string lpClassName)
+    {
+        return FindWindow(lpClassName, null);
+    }
+
     [DllImport("user32.dll", EntryPoint = "PostMessageW")]
     public static extern bool PostMessage(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam);
 
@@ -130,7 +137,7 @@ $p = Start-Process -FilePath $ExePath -PassThru
 $settings = [IntPtr]::Zero
 $deadline = (Get-Date).AddSeconds($SettingsTimeoutSec)
 while ((Get-Date) -lt $deadline) {
-    $settings = [Smoke]::FindWindow('WM_NIGHT_Settings', $null)
+    $settings = [Smoke]::FindWindowByClass('WM_NIGHT_Settings')
     if ($settings -ne [IntPtr]::Zero) { break }
     if ($p.HasExited) {
         throw ("App exited before the Settings window appeared: exit code {0} (0x{1:X8})" -f $p.ExitCode, $p.ExitCode)
@@ -141,7 +148,7 @@ if ($settings -eq [IntPtr]::Zero) {
     Invoke-HangAutopsy $p 'no-settings-window' -KeepAlive
     # Even without Settings, the teardown path is testable: if the tray window exists, try a
     # graceful exit anyway and report the exit code — that's the number winget cares about.
-    $tray = [Smoke]::FindWindow('WM_NIGHT_Tray', $null)
+    $tray = [Smoke]::FindWindowByClass('WM_NIGHT_Tray')
     if ($tray -ne [IntPtr]::Zero -and -not $p.HasExited) {
         Write-Host 'Tray window exists; attempting graceful exit (IDM_EXIT) for an exit-code reading...'
         [void][Smoke]::PostMessage($tray, $WM_COMMAND, [UIntPtr]::new($IDM_EXIT), [IntPtr]::Zero)
@@ -171,7 +178,7 @@ if ([Smoke]::IsWindow($settings)) {
 }
 
 Write-Host 'Exiting via the tray window (WM_COMMAND / IDM_EXIT)...'
-$tray = [Smoke]::FindWindow('WM_NIGHT_Tray', $null)
+$tray = [Smoke]::FindWindowByClass('WM_NIGHT_Tray')
 if ($tray -eq [IntPtr]::Zero) {
     Invoke-HangAutopsy $p 'no-tray-window'
     throw 'Tray window not found after closing Settings.'
