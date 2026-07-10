@@ -1,0 +1,98 @@
+name: Exit-code smoke
+
+# Replays the winget validation harness's launch-and-quit sequence against the SIGNED
+# release MSIX on hosted runners (amd64 + arm64) and fails on any nonzero exit code.
+# Exists to catch 0xC000027B stowed-exception exits (winget-pkgs PR #393605) in an
+# environment closer to the validation VM than a desktop session — and, if one fires,
+# to capture the WER crash dump we could never get out of Microsoft's pipeline.
+#
+# Tests the released MSIX (not a CI build): the exe declares uiAccess, and Windows only
+# launches a uiAccess binary that is signed and in a secure location — which the
+# Trusted-Signing-signed package under WindowsApps is, and an unsigned CI build is not.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to test (e.g. v0.1.1.3); empty tests the latest release
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: launch/exit smoke (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout WM_NIGHT
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Enable WER local crash dumps for WM_NIGHT.exe
+        run: |
+          $dumps = Join-Path $env:RUNNER_TEMP 'werdumps'
+          New-Item -ItemType Directory -Force $dumps | Out-Null
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\WM_NIGHT.exe'
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name DumpFolder -Value $dumps -Type ExpandString
+          Set-ItemProperty -Path $key -Name DumpType   -Value 2      -Type DWord   # full dump
+          Set-ItemProperty -Path $key -Name DumpCount  -Value 5      -Type DWord
+          "WER_DUMP_DIR=$dumps" >> $env:GITHUB_ENV
+
+      - name: Download release MSIX
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'msix'
+          New-Item -ItemType Directory -Force $dest | Out-Null
+          $dl = @('release', 'download', '-R', $env:GITHUB_REPOSITORY,
+                  '-p', "WM_NIGHT-windows-${{ matrix.arch }}.msix", '-D', $dest)
+          if ($env:TAG) { $dl += $env:TAG }
+          gh @dl
+          $msix = Join-Path $dest "WM_NIGHT-windows-${{ matrix.arch }}.msix"
+          if (-not (Test-Path $msix)) { throw "Download failed: $msix" }
+          "MSIX_PATH=$msix" >> $env:GITHUB_ENV
+
+      - name: Run launch/exit smoke test
+        run: .\scripts\exitcode_smoke.ps1 -MsixPath $env:MSIX_PATH
+
+      - name: Collect crash diagnostics
+        if: failure()
+        run: |
+          Write-Host '--- Application Error / WER events (last 30 min) ---'
+          Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'; StartTime = (Get-Date).AddMinutes(-30)
+          } -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -in 'Application Error', 'Windows Error Reporting' -and
+                           $_.Message -match 'WM_NIGHT' } |
+            ForEach-Object { $_.TimeCreated; $_.Message; '---' }
+          Write-Host "--- Dumps in $env:WER_DUMP_DIR ---"
+          Get-ChildItem $env:WER_DUMP_DIR -ErrorAction SilentlyContinue
+
+      - name: Upload crash dumps
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: werdumps-${{ matrix.arch }}
+          path: ${{ env.WER_DUMP_DIR }}
+          if-no-files-found: ignore
