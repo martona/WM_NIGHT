@@ -1,14 +1,17 @@
 name: Exit-code smoke
 
-# Replays the winget validation harness's launch-and-quit sequence against the SIGNED
-# release MSIX on hosted runners (amd64 + arm64) and fails on any nonzero exit code.
+# Replays the winget validation harness's launch-and-quit sequence against the release
+# binaries on hosted runners (amd64 + arm64) and fails on any nonzero exit code.
 # Exists to catch 0xC000027B stowed-exception exits (winget-pkgs PR #393605) in an
 # environment closer to the validation VM than a desktop session — and, if one fires,
 # to capture the WER crash dump we could never get out of Microsoft's pipeline.
 #
-# Tests the released MSIX (not a CI build): the exe declares uiAccess, and Windows only
-# launches a uiAccess binary that is signed and in a secure location — which the
-# Trusted-Signing-signed package under WindowsApps is, and an unsigned CI build is not.
+# Hosted runners have UAC disabled (EnableLUA=0), and Windows cannot mint a UIAccess
+# token with UAC off — CreateProcess on a uiAccess-manifested exe fails with access
+# denied before the app runs at all. So this can't launch the MSIX-installed exe the
+# way the winget harness does; instead it installs the MSIX as a sanity check, then
+# runs the release-zip exe with uiAccess stripped from its embedded manifest (mt.exe).
+# The XAML launch/exit paths under test don't depend on the uiAccess flag.
 
 on:
   workflow_dispatch:
@@ -47,6 +50,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Report UAC state
+        run: |
+          $lua = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System').EnableLUA
+          Write-Host "EnableLUA=$lua (0 = UAC off: uiAccess launches are impossible on this runner)"
+
       - name: Enable WER local crash dumps for WM_NIGHT.exe
         run: |
           $dumps = Join-Path $env:RUNNER_TEMP 'werdumps'
@@ -58,23 +66,58 @@ jobs:
           Set-ItemProperty -Path $key -Name DumpCount  -Value 5      -Type DWord
           "WER_DUMP_DIR=$dumps" >> $env:GITHUB_ENV
 
-      - name: Download release MSIX
+      - name: Download release assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
         run: |
-          $dest = Join-Path $env:RUNNER_TEMP 'msix'
+          $dest = Join-Path $env:RUNNER_TEMP 'release'
           New-Item -ItemType Directory -Force $dest | Out-Null
           $dl = @('release', 'download', '-R', $env:GITHUB_REPOSITORY,
+                  '-p', "WM_NIGHT-windows-${{ matrix.arch }}.zip",
                   '-p', "WM_NIGHT-windows-${{ matrix.arch }}.msix", '-D', $dest)
           if ($env:TAG) { $dl += $env:TAG }
           gh @dl
-          $msix = Join-Path $dest "WM_NIGHT-windows-${{ matrix.arch }}.msix"
-          if (-not (Test-Path $msix)) { throw "Download failed: $msix" }
-          "MSIX_PATH=$msix" >> $env:GITHUB_ENV
+          "RELEASE_DIR=$dest" >> $env:GITHUB_ENV
+
+      - name: Install MSIX (sanity check)
+        run: |
+          Add-AppxPackage -Path (Join-Path $env:RELEASE_DIR "WM_NIGHT-windows-${{ matrix.arch }}.msix")
+          $pkg = Get-AppxPackage -Name 'WM-NIGHT'
+          if (-not $pkg) { throw 'WM-NIGHT package not found after Add-AppxPackage.' }
+          Write-Host "Installed $($pkg.PackageFullName)"
+
+      - name: Extract zip and strip uiAccess from the exe manifest
+        run: |
+          $app = Join-Path $env:RUNNER_TEMP 'app'
+          Expand-Archive (Join-Path $env:RELEASE_DIR "WM_NIGHT-windows-${{ matrix.arch }}.zip") $app
+          $exe = Join-Path $app 'WM_NIGHT.exe'
+          foreach ($f in @($exe, (Join-Path $app 'WM_NIGHThook.dll'))) {
+            if (-not (Test-Path $f)) { throw "Missing in zip: $f" }
+          }
+          # mt.exe from the Windows SDK; prefer the runner's native arch, fall back to x64.
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}\mt.exe" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $mt) {
+            $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\10.*\x64\mt.exe" |
+                  Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if (-not $mt) { throw 'mt.exe not found in the Windows SDK.' }
+          Write-Host "Using $($mt.FullName)"
+          $manifest = Join-Path $env:RUNNER_TEMP 'embedded.manifest'
+          & $mt.FullName -nologo -inputresource:"$exe;#1" -out:"$manifest"
+          if ($LASTEXITCODE -ne 0) { throw 'mt.exe failed to extract the manifest.' }
+          $xml = Get-Content -Raw $manifest
+          Write-Host "--- embedded manifest (before) ---`n$xml"
+          if ($xml -notmatch 'uiAccess="true"') { throw 'uiAccess="true" not found in the manifest.' }
+          $xml -replace 'uiAccess="true"', 'uiAccess="false"' | Set-Content -NoNewline $manifest
+          & $mt.FullName -nologo -manifest "$manifest" -outputresource:"$exe;#1"
+          if ($LASTEXITCODE -ne 0) { throw 'mt.exe failed to re-embed the manifest.' }
+          Write-Host 'uiAccess stripped (exe signature is now invalid; irrelevant without uiAccess).'
+          "SMOKE_EXE=$exe" >> $env:GITHUB_ENV
 
       - name: Run launch/exit smoke test
-        run: .\scripts\exitcode_smoke.ps1 -MsixPath $env:MSIX_PATH
+        run: .\scripts\exitcode_smoke.ps1 -ExePath $env:SMOKE_EXE
 
       - name: Collect crash diagnostics
         if: failure()

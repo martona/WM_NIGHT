@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: MIT
 #
 # Exit-code smoke test: replays the winget validation harness's launch sequence against a
-# signed WM_NIGHT MSIX and fails if the process exits nonzero (the harness treats any nonzero
-# exit code as a failed run — see winget-pkgs PR #393605, exit code 0xC000027B).
+# WM_NIGHT.exe and fails if the process exits nonzero (the harness treats any nonzero exit
+# code as a failed run — see winget-pkgs PR #393605, exit code 0xC000027B).
 #
-# Sequence: install the MSIX; launch WM_NIGHT.exe from WindowsApps by path with NO arguments
-# (that opens the XAML-Islands Settings window, the riskiest surface); close Settings via
-# WM_CLOSE; exit via the tray window (WM_COMMAND/IDM_EXIT, the full SettingsShutdown teardown
-# path); assert exit code 0.
+# Sequence: launch the exe with NO arguments (that opens the XAML-Islands Settings window,
+# the riskiest surface); close Settings via WM_CLOSE; exit via the tray window
+# (WM_COMMAND/IDM_EXIT, the full SettingsShutdown teardown path); assert exit code 0.
 #
-# Needs an elevated prompt (PostMessage to a uiAccess process is UIPI-gated) and a signed
-# package (Windows refuses to launch an unsigned uiAccess exe). Note the app bounces
-# explorer.exe on exit — harmless on a CI runner, mildly annoying on a desktop.
+# The exe must be launchable in the calling environment. Note that a uiAccess-manifested
+# build will not launch AT ALL where UAC is disabled (GitHub-hosted runners: EnableLUA=0
+# means Windows cannot mint a UIAccess token, so CreateProcess fails with access denied) —
+# the CI workflow strips uiAccess from the release binary first. On a normal desktop, point
+# this at the installed package exe or any signed build. The app bounces explorer.exe on
+# exit — harmless on a runner, mildly annoying on a desktop.
 
 param(
-    [Parameter(Mandatory)] [string] $MsixPath,
+    [Parameter(Mandatory)] [string] $ExePath,
     [int] $SettingsTimeoutSec = 90,
     [int] $ExitTimeoutSec = 60
 )
@@ -34,16 +36,11 @@ $WM_CLOSE   = 0x0010
 $WM_COMMAND = 0x0111
 $IDM_EXIT   = 40003        # src/resource.h
 
-Write-Host "Installing $MsixPath"
-Add-AppxPackage -Path $MsixPath
-$pkg = Get-AppxPackage -Name 'WM-NIGHT'
-if (-not $pkg) { throw 'WM-NIGHT package not found after Add-AppxPackage.' }
-$exe = Join-Path $pkg.InstallLocation 'WM_NIGHT.exe'
-Write-Host "Installed $($pkg.PackageFullName)"
+if (-not (Test-Path $ExePath)) { throw "Not found: $ExePath" }
 
-# Launch exactly like the winget harness: the exe under WindowsApps, by path, no arguments.
-Write-Host "Launching $exe"
-$p = Start-Process -FilePath $exe -PassThru
+# Launch like the winget harness: by path, no arguments.
+Write-Host "Launching $ExePath"
+$p = Start-Process -FilePath $ExePath -PassThru
 
 # A no-arg launch opens the Settings window; XAML Islands cold start can be slow on a runner.
 $settings = [IntPtr]::Zero
