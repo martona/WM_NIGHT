@@ -143,7 +143,15 @@ namespace
     // WM_CTLCOLOR/NOTIFY/ERASE either fail-fasts (InputHost / CTF input site) or is simply
     // pointless (no visible UI). None are classic controls umbra themes. Grown empirically per
     // target (explorer's InputSite; mmc's CTF / clipboard / GDI+ / .NET broadcast windows).
-    // The cleaner long-term shape is a per-target allow-list; this deny-list is the interim.
+    //
+    // Also: desktop shell items view. Hierarchy is
+    //   Progman | WorkerW → SHELLDLL_DefView → SysListView32 "FolderView"
+    // umbra's listview path corrupts icon layout there. SHELLDLL_DefView is shared with
+    // dialog surfaces (Previous Versions, etc.) where we still want host subclassing — so
+    // deny DefView only when its parent is already the desktop (Progman/WorkerW). Children
+    // are not created yet at DefView's WM_CREATE; the parent class is. FolderView is denied
+    // by title as well so the leaf stays off even if a host path races. Interim deny-list;
+    // long-term is a per-target allow-list.
     bool IsThemingBlacklisted(HWND hwnd) noexcept
     {
         wchar_t cls[128];
@@ -171,10 +179,33 @@ namespace
             L"OperationStatusWindow",
             L"OleMainThreadWndClass",      // OLE/COM hidden marshalling window
             L"Event Viewer Snapin Synch",  // mmc Event Viewer snap-in hidden sync window
+            L"Progman",                    // desktop Program Manager
+            L"WorkerW",                    // desktop WorkerW host (Win8+)
         };
         for (const wchar_t* e : kExacts)
             if (::wcscmp(cls, e) == 0)
                 return true;
+
+        // Desktop DefView only (parent is Progman/WorkerW — available at WM_CREATE).
+        if (::CompareStringOrdinal(cls, -1, L"SHELLDLL_DefView", -1, TRUE) == CSTR_EQUAL)
+        {
+            const HWND parent = ::GetParent(hwnd);
+            wchar_t pcls[64]{};
+            if (parent != nullptr
+                && ::GetClassNameW(parent, pcls, ARRAYSIZE(pcls)) > 0
+                && (::CompareStringOrdinal(pcls, -1, L"Progman", -1, TRUE) == CSTR_EQUAL
+                    || ::CompareStringOrdinal(pcls, -1, L"WorkerW", -1, TRUE) == CSTR_EQUAL))
+                return true;
+        }
+
+        // Shell items listview (desktop + explorer folder panes).
+        if (::CompareStringOrdinal(cls, -1, WC_LISTVIEW, -1, TRUE) == CSTR_EQUAL)
+        {
+            wchar_t title[64]{};
+            if (::GetWindowTextW(hwnd, title, ARRAYSIZE(title)) > 0
+                && ::CompareStringOrdinal(title, -1, L"FolderView", -1, FALSE) == CSTR_EQUAL)
+                return true;
+        }
 
         return false;
     }

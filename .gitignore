@@ -14,3 +14,4 @@
 # claude
 .claude/
 handoff.md
+vcpkg-overlay-local/
