@@ -16,11 +16,22 @@
       turns OFF HKCU write virtualization so the host's registry writes land in the REAL
       HKCU, "visible to other processes outside the package." That is what lets the
       injected WM_NIGHThook.dll (running in UNPACKAGED explorer/regedit) actually read the
-      whitelist, and lets the HKCU\...\Run autostart reach the logon scan. Same registry
-      code works packaged and loose — no refactor.
+      whitelist. Same registry code works packaged and loose — no refactor.
 
-  DISTRIBUTION CAVEAT: both are RESTRICTED capabilities. Sideloading a SIGNED package is
-  fine; the Microsoft Store requires approval for restricted capabilities. unvirtualizedResources
+    * desktop:windows.startupTask -> official packaged logon autostart (package identity;
+      survives updates). TaskId WMNIGHTStartup; host RequestEnable's it. StartupTask launches
+      the exe with NO args (bare). Do NOT use HKCU\...\Run with a WindowsApps path — logon
+      cannot reliably CreateProcess those paths.
+
+    * uap10:Parameters="/settings") on Application -> Start menu / tile / AppsFolder activation
+      passes /settings so Settings opens. Distinct from StartupTask (bare → tray). Host rules:
+        /settings          → Settings
+        /tray              → tray (loose Run)
+        packaged bare      → tray (StartupTask)
+        unpackaged bare    → Settings
+
+  DISTRIBUTION CAVEAT: uiAccess + unvirtualizedResources are RESTRICTED capabilities.
+  Sideloading a SIGNED package is fine; the Microsoft Store requires approval. unvirtualizedResources
   is reportedly install-constrained (PowerShell Add-AppxPackage + developer mode; AppInstaller/
   double-click may refuse) — verify for your distribution path before relying on it.
 
@@ -30,9 +41,11 @@
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
   xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap desktop6 rescap">
+  IgnorableNamespaces="uap uap10 desktop desktop6 rescap">
 
   <Identity
     Name="@IDENTITY_NAME@"
@@ -67,7 +80,12 @@
   </Capabilities>
 
   <Applications>
-    <Application Id="WMNIGHT" Executable="WM_NIGHT.exe" EntryPoint="Windows.FullTrustApplication">
+    <!-- Start / tile / AppsFolder: Parameters → /settings (opens Settings).
+         StartupTask extension below: same exe, no parameters → bare → tray. -->
+    <Application Id="WMNIGHT"
+                 Executable="WM_NIGHT.exe"
+                 EntryPoint="Windows.FullTrustApplication"
+                 uap10:Parameters="/settings">
       <uap:VisualElements
         DisplayName="WM_NIGHT"
         Description="Native dark mode for classic Win32 desktop apps."
@@ -76,6 +94,17 @@
         Square44x44Logo="Images\Square44x44Logo.png">
         <uap:DefaultTile Square71x71Logo="Images\Square71x71Logo.png" />
       </uap:VisualElements>
+      <Extensions>
+        <desktop:Extension
+            Category="windows.startupTask"
+            Executable="WM_NIGHT.exe"
+            EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask
+              TaskId="WMNIGHTStartup"
+              Enabled="true"
+              DisplayName="WM_NIGHT" />
+        </desktop:Extension>
+      </Extensions>
     </Application>
   </Applications>
 </Package>

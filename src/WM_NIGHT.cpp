@@ -33,6 +33,11 @@
 #include <dbghelp.h>    // symbol resolution for dui70's non-exported Element::PaintBackground
 #include <tlhelp32.h>   // process snapshot, to bounce explorer.exe on shutdown
 
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.ApplicationModel.h>
+
 #include "umbra.h"      // dark-mode library (linked into the host for its own UI)
 #include "resource.h"
 #include "version.h"
@@ -46,6 +51,9 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")   // registry: autostart + single-instance
 #pragma comment(lib, "umbra.lib")      // dark-mode library (vcpkg: WM_UMBRA git registry)
+
+// Must match packaging/AppxManifest.xml.in desktop:StartupTask TaskId.
+static constexpr wchar_t kStartupTaskId[] = L"WMNIGHTStartup";
 
 namespace
 {
@@ -100,9 +108,28 @@ namespace
         return slash == std::wstring::npos ? L"." : p.substr(0, slash);
     }
 
-    // Register / unregister logon autostart (HKCU Run). The command carries /tray so the launched
-    // instance stays quietly in the tray (no Settings pop). Best-effort.
-    void SetAutostart(bool enable)
+    // --- logon autostart -------------------------------------------------------
+    // Unpackaged: HKCU\...\Run with "\"path\" /tray" (GetModuleFileName is stable).
+    // Packaged (MSIX): windows.startupTask (TaskId = WMNIGHTStartup). Writing Run with
+    // GetModuleFileName is wrong under MSIX — the path is versioned under WindowsApps (dies
+    // on upgrade) and a loose Debug/Release run overwrites Run with a tree path that is not
+    // what the user installed. StartupTask is package-identity based.
+    //
+    // Call after COM/WinRT apartment init (SettingsInit) so RequestEnableAsync works.
+
+    bool IsPackaged();   // defined with the DLL-staging helpers below
+
+    void ClearRunKeyAutostart() noexcept
+    {
+        HKEY key = nullptr;
+        if (::RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                            0, KEY_SET_VALUE, &key) != ERROR_SUCCESS)
+            return;
+        ::RegDeleteValueW(key, L"WM_NIGHT");
+        ::RegCloseKey(key);
+    }
+
+    void SetRunKeyAutostart(bool enable) noexcept
     {
         HKEY key = nullptr;
         if (::RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -125,6 +152,49 @@ namespace
             ::RegDeleteValueW(key, L"WM_NIGHT");
         }
         ::RegCloseKey(key);
+    }
+
+    void SetPackagedStartupTask(bool enable) noexcept
+    {
+        try
+        {
+            auto tasks = winrt::Windows::ApplicationModel::StartupTask::GetForCurrentPackageAsync().get();
+            for (auto const& task : tasks)
+            {
+                if (task.TaskId() != kStartupTaskId)
+                    continue;
+                if (enable)
+                {
+                    // Enabled in the manifest; still RequestEnable so a user who disabled us
+                    // in Task Manager → Startup gets re-prompted / re-enabled when they launch.
+                    const auto state = task.RequestEnableAsync().get();
+                    (void)state;
+                }
+                else
+                {
+                    task.Disable();
+                }
+                break;
+            }
+        }
+        catch (...)
+        {
+            // Best-effort: no package / no task / user disabled permanently.
+        }
+    }
+
+    void SetAutostart(bool enable)
+    {
+        if (IsPackaged())
+        {
+            // Drop any stale HKCU Run entry left by a loose build on the same machine.
+            ClearRunKeyAutostart();
+            SetPackagedStartupTask(enable);
+        }
+        else
+        {
+            SetRunKeyAutostart(enable);
+        }
     }
 
     // --- dui70 Element::PaintBackground RVA resolution (host-side) -----------
@@ -538,38 +608,46 @@ std::wstring DiagDuiLine()
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
 {
-    // Safety hatch: holding Shift while we start (e.g. at logon) makes us exit silently BEFORE
-    // installing the global hook — a way out if a crash/conflict would otherwise hose explorer.
-    if ((::GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0)
-        return 0;
-
     g_hInst = hInstance;
     ::SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // Autostart launches us with /tray (stay quietly in the tray); a manual launch (no /tray) also
-    // opens the Settings window once we are up.
-    const bool trayMode = (lpCmdLine != nullptr && ::wcsstr(lpCmdLine, L"/tray") != nullptr);
+    // Launch mode (packaged Start menu passes /settings via uap10:Parameters in AppxManifest):
+    //   /settings           → open Settings (Start / tile / AppsFolder)
+    //   /tray               → tray only (loose HKCU Run)
+    //   packaged bare       → tray only (StartupTask — no argv)
+    //   unpackaged bare     → open Settings (dev / double-click)
+    const bool wantSettings = (lpCmdLine != nullptr && ::wcsstr(lpCmdLine, L"/settings") != nullptr);
+    const bool wantTray     = (lpCmdLine != nullptr && ::wcsstr(lpCmdLine, L"/tray") != nullptr);
+    const bool showSettingsOnLaunch =
+        wantSettings || (!wantTray && !IsPackaged());
+    const bool quietTray = !showSettingsOnLaunch;
+
+    // Safety hatch: holding Shift while we start exits silently BEFORE installing the global
+    // hook — a way out if a crash/conflict would otherwise hose explorer. Skipped for quiet
+    // tray / logon starts so sticky-keys or a held Shift at login cannot kill autostart.
+    if (!quietTray && (::GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0)
+        return 0;
 
     // Single instance: a second host would install a second global WH_CBT hook and double-load.
-    // A manual relaunch surfaces the running instance's Settings; an autostart relaunch just exits.
+    // A Settings-bound relaunch surfaces the running instance; a quiet/autostart relaunch exits.
     // The handle is intentionally kept for the process lifetime (freed on exit).
     ::CreateMutexW(nullptr, FALSE, L"Local\\WM_NIGHT_singleton");
     if (::GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        if (!trayMode)
+        if (showSettingsOnLaunch)
             if (const HWND existing = ::FindWindowW(kWndClassName, nullptr))
                 ::PostMessageW(existing, WM_COMMAND, IDM_SETTINGS, 0);
         return 0;
     }
 
-    // Auto-run at logon. Only a manual Exit unregisters this; any other exit (Shift hatch, crash,
-    // reboot) leaves it so we come back next logon.
-    SetAutostart(true);
-
     const INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_STANDARD_CLASSES | ICC_LINK_CLASS };
     ::InitCommonControlsEx(&icc);
     umbra::initDarkMode();   // app-wide dark opt-in (also darkens our popup menu + message boxes)
     SettingsInit();          // COM apartment (STA) for the XAML-Islands Settings window
+
+    // Auto-run at logon (after apartment init — packaged path uses WinRT StartupTask).
+    // Only a manual Exit unregisters this; crash/reboot leave it so we come back next logon.
+    SetAutostart(true);
 
     g_taskbarCreated = ::RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -627,8 +705,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int)
 
     g_diagUiAccess = HasUiAccess();   // snapshot for the Settings diagnostics readout
 
-    // A manual launch (no /tray) opens Settings immediately; autostart stays quiet in the tray.
-    if (!trayMode)
+    // /settings or unpackaged bare → Settings; /tray or packaged StartupTask (bare) → tray only.
+    if (showSettingsOnLaunch)
         ShowSettingsWindow(g_hInst);
 
     MSG msg{};

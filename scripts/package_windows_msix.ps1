@@ -11,12 +11,10 @@
 
   Adapted from ../clipp/scripts/package_windows_msix.ps1.
 
-  The manifest declares the rescap:uiAccess and rescap:unvirtualizedResources restricted
-  capabilities, so a packaged WM_NIGHT keeps uiAccess (it can still theme elevated regedit/mmc)
-  and its HKCU writes reach the injected DLL + the logon-scan autostart (registry write
-  virtualization disabled) -- the SAME code as the loose build, no refactor. Both are RESTRICTED
-  capabilities: sideloading a signed package is fine; the Store needs approval; and
-  unvirtualizedResources may constrain install to PowerShell/dev-mode. See the manifest header.
+  Manifest: rescap:uiAccess, rescap:unvirtualizedResources, desktop:windows.startupTask
+  (packaged logon), and uap10:Parameters="/settings") on Application (Start menu opens
+  Settings; StartupTask is bare → tray). unvirtualizedResources keeps whitelist HKCU visible
+  to unpackaged explorer/regedit. Restricted caps: signed sideload OK; Store needs approval.
 
 .NOTES
   Requires the Windows 10/11 SDK (makeappx.exe, makepri.exe) and, to sign, sign.exe
