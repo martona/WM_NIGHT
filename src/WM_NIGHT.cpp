@@ -62,7 +62,7 @@ namespace
 
     // Startup-diagnostics snapshot, surfaced in the Settings window via the HostDiag accessors.
     bool      g_diagUiAccess   = false;
-    bool      g_diagDuiEnabled = false;   // EnableDuiHook registry gate state (default OFF)
+    bool      g_diagDuiEnabled = false;   // EnableDuiHook registry gate state (default ON)
     bool      g_diagDuiOk      = false;
     DWORD     g_diagDuiRva     = 0;
 
@@ -324,30 +324,31 @@ namespace
         return wrote;
     }
 
-    // Registry gate for the dui70 Element::PaintBackground hook. DUI/Control-Panel theming is the
-    // most invasive surface we touch — it Detours a private DirectUI member located only by RVA — so
-    // it ships OFF and the user opts in via HKCU\Software\WM_NIGHT\EnableDuiHook (REG_DWORD) == 1.
-    // Absent / 0 / wrong type => disabled (the default).
+    // Registry gate for the dui70 Element::PaintBackground hook (Control Panel DirectUI chrome).
+    // Default ON: absent key / read failure => enabled. Explicit opt-out:
+    //   HKCU\Software\WM_NIGHT\EnableDuiHook (REG_DWORD) = 0
     bool IsDuiHookEnabled() noexcept
     {
         DWORD val = 0, sz = sizeof(val);
-        return ::RegGetValueW(HKEY_CURRENT_USER, L"Software\\WM_NIGHT", L"EnableDuiHook",
-                              RRF_RT_REG_DWORD, nullptr, &val, &sz) == ERROR_SUCCESS && val == 1;
+        if (::RegGetValueW(HKEY_CURRENT_USER, L"Software\\WM_NIGHT", L"EnableDuiHook",
+                           RRF_RT_REG_DWORD, nullptr, &val, &sz) != ERROR_SUCCESS)
+            return true;   // absent / wrong type => default ON
+        return val != 0;
     }
 
     // Resolve the dui70 RVA and hand it to the DLL via UmbraSetDuiPaintBg (a shared section
     // forwards it to every loaded copy). Synchronous and instant — it's an export-table lookup, no
     // network. Best-effort: on failure the DLL simply runs without the DUI paint hook.
     //
-    // Gated: when EnableDuiHook is off (the default) we never hand over an RVA, so the shared
+    // Gated: when EnableDuiHook is explicitly 0 we never hand over an RVA, so the shared
     // section stays 0 and no loaded copy attaches the hook (setProcessWideDuiPaintHook no-ops).
     void HandOffDuiPaintBg()
     {
         g_diagDuiEnabled = IsDuiHookEnabled();
         if (!g_diagDuiEnabled)
         {
-            Dbg(L"[dui] EnableDuiHook off (default); DUI paint hook disabled. Set "
-                L"HKCU\\Software\\WM_NIGHT\\EnableDuiHook=1 (DWORD) to enable.\n");
+            Dbg(L"[dui] EnableDuiHook=0; DUI paint hook disabled. Delete the value or set "
+                L"HKCU\\Software\\WM_NIGHT\\EnableDuiHook=1 (DWORD) to re-enable.\n");
             return;
         }
         const auto setDui = reinterpret_cast<void (*)(unsigned long, unsigned long, unsigned long)>(
