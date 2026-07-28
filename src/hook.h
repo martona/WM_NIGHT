@@ -6,6 +6,8 @@
 // here (or define it from the build) to compile every diagnostic log out across host and DLL.
 // TEMP scaffolding — the logs never ship.
 #ifndef UMBRA_DIAG
+// TEMP: on while hunting DUI CP-vs-desktop discriminants (el class / module / caller).
+// Flip back to 0 before ship — per-paint logging is heavy.
 #  define UMBRA_DIAG 0
 #endif
 
